@@ -123,3 +123,49 @@ service cloud.firestore {
   }
 }
 ```
+
+## 7) Node bridge + Pion peer (no Firebase server creds in Go)
+
+This mode keeps Firebase auth/signaling in Node (client SDK), while Go/Pion speaks to local bridge HTTP only.
+
+Added files:
+
+- `/Users/evgeni/Documents/GitHub/glosos-ms/bridge/index.js`
+- `/Users/evgeni/Documents/GitHub/glosos-ms/bridge/package.json`
+- `/Users/evgeni/Documents/GitHub/glosos-ms/cmd/pion_bridge_peer/main.go`
+
+### 7.1 Start Node bridge
+
+```bash
+cd /Users/evgeni/Documents/GitHub/glosos-ms/bridge
+npm install
+
+export FIREBASE_API_KEY="AIzaSyA1iO6LzNaq9dwPb71m014p29_lUHwnkbs"
+export FIREBASE_AUTH_DOMAIN="glosos-103f7.firebaseapp.com"
+export FIREBASE_PROJECT_ID="glosos-103f7"
+export FIREBASE_STORAGE_BUCKET="glosos-103f7.firebasestorage.app"
+export FIREBASE_MESSAGING_SENDER_ID="314422729512"
+export FIREBASE_APP_ID="1:314422729512:web:4fb8cb0278e64a5c374e1d"
+
+export BRIDGE_EMAIL="YOUR_FIREBASE_USER_EMAIL"
+export BRIDGE_PASSWORD="YOUR_FIREBASE_USER_PASSWORD"
+export WEBRTC_CALLS_COLLECTION="webrtc_calls"
+export BRIDGE_PORT="8080"
+export TURN_SERVER="54.37.235.123:3478"
+export TURN_AUTH_SECRET="YOUR_COTURN_STATIC_AUTH_SECRET"
+export TURN_TTL_SECONDS="600"
+
+npm start
+```
+
+### 7.2 Start Pion peer (in another terminal)
+
+```bash
+cd /Users/evgeni/Documents/GitHub/glosos-ms
+go mod tidy
+go run ./cmd/pion_bridge_peer -role callee -call-id room-123 -bridge-url http://127.0.0.1:8080
+```
+
+### 7.3 Browser side
+
+Use your existing browser page as caller with the same `call-id` (`room-123`), or run another Pion peer as caller.

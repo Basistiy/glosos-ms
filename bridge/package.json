@@ -1,0 +1,12 @@
+{
+  "name": "glosos-signaling-bridge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "firebase": "^12.5.0"
+  }
+}
