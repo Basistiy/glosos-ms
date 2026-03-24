@@ -5,7 +5,7 @@ import { spawn, spawnSync } from "child_process";
 import path from "path";
 import { createInterface } from "readline/promises";
 import { fileURLToPath } from "url";
-import { initializeApp } from "firebase/app";
+import { deleteApp, initializeApp } from "firebase/app";
 import {
   getAuth,
   signInWithEmailAndPassword
@@ -60,6 +60,8 @@ const config = {
   bridgeEmail: (process.env.BRIDGE_EMAIL || "").trim(),
   bridgePassword: (process.env.BRIDGE_PASSWORD || "").trim(),
   callsCollection: (process.env.WEBRTC_CALLS_COLLECTION || "webrtc_calls").trim(),
+  autoRestartFirebase: (process.env.AUTO_RESTART_FIREBASE || "1").trim() !== "0",
+  firebaseRestartIntervalMs: intEnv("FIREBASE_RESTART_INTERVAL_MS", 15 * 60 * 1000),
   port: intEnv("BRIDGE_PORT", 8080),
   autoStartMlxServer: (process.env.AUTO_START_MLX_SERVER || "1").trim() !== "0",
   mlxRunnerCommand: (process.env.MLX_RUNNER_COMMAND || "uv").trim(),
@@ -109,6 +111,17 @@ const agentState = {
   lineBuffer: "",
   nextRequestID: 1,
   pending: new Map()
+};
+
+const firebaseState = {
+  app: null,
+  auth: null,
+  functions: null,
+  db: null,
+  ownerUID: null,
+  credentials: null,
+  restartTimer: null,
+  reinitializing: false
 };
 
 async function getBridgeCredentials() {
@@ -247,6 +260,13 @@ function startTurnRefreshLoop(functions) {
   }, intervalMs);
 }
 
+function stopTurnRefreshLoop() {
+  if (turnState.refreshTimer) {
+    clearInterval(turnState.refreshTimer);
+    turnState.refreshTimer = null;
+  }
+}
+
 function prefixStream(stream, prefix) {
   let buffer = "";
   stream.on("data", (chunk) => {
@@ -271,6 +291,13 @@ function clearPeerRestartTimer() {
   if (peerState.restartTimer) {
     clearTimeout(peerState.restartTimer);
     peerState.restartTimer = null;
+  }
+}
+
+function clearFirebaseRestartTimer() {
+  if (firebaseState.restartTimer) {
+    clearTimeout(firebaseState.restartTimer);
+    firebaseState.restartTimer = null;
   }
 }
 
@@ -498,6 +525,157 @@ function rejectPendingAgentRequests(message) {
   agentState.pending.clear();
 }
 
+function detachSessionListeners(session) {
+  for (const timer of Object.values(session.retryTimers)) {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+  session.retryTimers = {};
+  for (const unsubscribe of session.unsubscribers) {
+    try {
+      unsubscribe();
+    } catch (_) {
+      // no-op
+    }
+  }
+  session.unsubscribers = [];
+}
+
+function attachSessionListeners(session, db) {
+  session.callRef = doc(db, config.callsCollection, session.callId);
+  session.callerCandidatesRef = collection(session.callRef, "callerCandidates");
+  session.calleeCandidatesRef = collection(session.callRef, "calleeCandidates");
+
+  const remoteDescriptionField = session.role === "caller" ? "answer" : "offer";
+  const remoteCandidatesRef = session.role === "caller" ? session.calleeCandidatesRef : session.callerCandidatesRef;
+
+  const startDescriptionWatch = () => {
+    const unsubscribe = onSnapshot(session.callRef, (snap) => {
+      if (!snap.exists()) return;
+      const data = snap.data() || {};
+      const desc = data[remoteDescriptionField];
+      if (!desc || typeof desc.sdp !== "string" || typeof desc.type !== "string") return;
+      if (session.remoteDescription && session.remoteDescription.sdp === desc.sdp) return;
+      session.remoteDescription = { type: desc.type, sdp: normalizeSDP(desc.sdp) };
+      session.remoteDescriptionVersion += 1;
+      console.log(
+        `[bridge] call=${session.callId} role=${session.role} remote description updated (${remoteDescriptionField})`
+      );
+    }, (err) => {
+      console.error(`[bridge] call=${session.callId} doc watch error`, err);
+      scheduleWatcherRetry(session, "description", startDescriptionWatch);
+    });
+    session.unsubscribers.push(unsubscribe);
+  };
+
+  const startCandidatesWatch = () => {
+    const unsubscribe = onSnapshot(remoteCandidatesRef, (snap) => {
+      for (const change of snap.docChanges()) {
+        if (change.type !== "added") continue;
+        const data = change.doc.data();
+        if (!data?.candidate) continue;
+        const createdAtMillis = timestampMillis(data.createdAt);
+        if (createdAtMillis > 0 && createdAtMillis < session.startedAt) {
+          continue;
+        }
+        const key = `${change.doc.id}:${data.candidate}`;
+        if (session.seenRemoteCandidateKeys.has(key)) {
+          continue;
+        }
+        session.seenRemoteCandidateKeys.add(key);
+        const item = {
+          id: session.nextCandidateID++,
+          candidate: data.candidate,
+          sdpMid: data.sdpMid ?? null,
+          sdpMLineIndex: data.sdpMLineIndex ?? null,
+          usernameFragment: data.usernameFragment ?? null
+        };
+        session.remoteCandidates.push(item);
+      }
+    }, (err) => {
+      console.error(`[bridge] call=${session.callId} candidates watch error`, err);
+      scheduleWatcherRetry(session, "candidates", startCandidatesWatch);
+    });
+    session.unsubscribers.push(unsubscribe);
+  };
+
+  startDescriptionWatch();
+  startCandidatesWatch();
+}
+
+async function initializeFirebaseRuntime(credentials) {
+  const firebaseApp = initializeApp(config.firebase, `bridge-${Date.now()}`);
+  const auth = getAuth(firebaseApp);
+  const functions = getFunctions(firebaseApp, config.turnFunctionRegion);
+  const db = getFirestore(firebaseApp);
+
+  await signInWithEmailAndPassword(auth, credentials.email, credentials.password);
+  const user = auth.currentUser;
+  if (!user) {
+    throw new Error("firebase sign-in succeeded but currentUser is missing");
+  }
+
+  const selfCheckDoc = doc(db, config.callsCollection, "_bridge_healthcheck");
+  try {
+    const snap = await getDoc(selfCheckDoc);
+    console.log(`[bridge] firebase auth ok uid=${user.uid} healthcheck_doc_exists=${snap.exists()}`);
+  } catch (err) {
+    console.warn(`[bridge] firebase auth ok uid=${user.uid}; healthcheck read skipped: ${err.message || String(err)}`);
+  }
+
+  const previousApp = firebaseState.app;
+  stopTurnRefreshLoop();
+
+  firebaseState.app = firebaseApp;
+  firebaseState.auth = auth;
+  firebaseState.functions = functions;
+  firebaseState.db = db;
+  firebaseState.ownerUID = user.uid;
+  firebaseState.credentials = credentials;
+
+  app.locals.db = db;
+  app.locals.functions = functions;
+  app.locals.ownerUID = user.uid;
+
+  for (const session of sessions.values()) {
+    detachSessionListeners(session);
+    attachSessionListeners(session, db);
+  }
+
+  await refreshTurnCredentials(functions);
+  startTurnRefreshLoop(functions);
+
+  if (previousApp) {
+    await deleteApp(previousApp).catch(() => {});
+  }
+}
+
+function scheduleFirebaseRestart() {
+  if (!config.autoRestartFirebase) {
+    return;
+  }
+  clearFirebaseRestartTimer();
+  firebaseState.restartTimer = setTimeout(async () => {
+    if (firebaseState.reinitializing || !firebaseState.credentials) {
+      scheduleFirebaseRestart();
+      return;
+    }
+    firebaseState.reinitializing = true;
+    console.log(
+      `[bridge] refreshing firebase runtime interval_ms=${Math.max(60_000, config.firebaseRestartIntervalMs)}`
+    );
+    try {
+      await initializeFirebaseRuntime(firebaseState.credentials);
+    } catch (err) {
+      console.error("[bridge] firebase runtime refresh failed", err);
+    } finally {
+      firebaseState.reinitializing = false;
+      scheduleFirebaseRestart();
+    }
+  }, Math.max(60_000, config.firebaseRestartIntervalMs));
+}
+
 function handleAgentStdout(chunk) {
   agentState.lineBuffer += chunk.toString();
   const lines = agentState.lineBuffer.split(/\r?\n/);
@@ -611,95 +789,29 @@ function scheduleWatcherRetry(session, watchName, startWatch) {
 }
 
 function makeSession(callId, role, db) {
-  const callRef = doc(db, config.callsCollection, callId);
-  const callerCandidatesRef = collection(callRef, "callerCandidates");
-  const calleeCandidatesRef = collection(callRef, "calleeCandidates");
-
   const session = {
     callId,
     role,
-    callRef,
-    callerCandidatesRef,
-    calleeCandidatesRef,
+    callRef: null,
+    callerCandidatesRef: null,
+    calleeCandidatesRef: null,
     remoteDescription: null,
     remoteDescriptionVersion: 0,
     remoteCandidates: [],
     nextCandidateID: 1,
     unsubscribers: [],
     retryTimers: {},
+    seenRemoteCandidateKeys: new Set(),
     startedAt: Date.now(),
     closed: false
   };
-
-  const remoteDescriptionField = role === "caller" ? "answer" : "offer";
-  const remoteCandidatesRef = role === "caller" ? calleeCandidatesRef : callerCandidatesRef;
-
-  const startDescriptionWatch = () => {
-    const unsubscribe = onSnapshot(callRef, (snap) => {
-      if (!snap.exists()) return;
-      const data = snap.data() || {};
-      const desc = data[remoteDescriptionField];
-      if (!desc || typeof desc.sdp !== "string" || typeof desc.type !== "string") return;
-      if (session.remoteDescription && session.remoteDescription.sdp === desc.sdp) return;
-      session.remoteDescription = { type: desc.type, sdp: normalizeSDP(desc.sdp) };
-      session.remoteDescriptionVersion += 1;
-      console.log(
-        `[bridge] call=${callId} role=${role} remote description updated (${remoteDescriptionField})`
-      );
-    }, (err) => {
-      console.error(`[bridge] call=${callId} doc watch error`, err);
-      scheduleWatcherRetry(session, "description", startDescriptionWatch);
-    });
-    session.unsubscribers.push(unsubscribe);
-  };
-
-  const startCandidatesWatch = () => {
-    const unsubscribe = onSnapshot(remoteCandidatesRef, (snap) => {
-      for (const change of snap.docChanges()) {
-        if (change.type !== "added") continue;
-        const data = change.doc.data();
-        if (!data?.candidate) continue;
-        const createdAtMillis = timestampMillis(data.createdAt);
-        if (createdAtMillis > 0 && createdAtMillis < session.startedAt) {
-          continue;
-        }
-        const item = {
-          id: session.nextCandidateID++,
-          candidate: data.candidate,
-          sdpMid: data.sdpMid ?? null,
-          sdpMLineIndex: data.sdpMLineIndex ?? null,
-          usernameFragment: data.usernameFragment ?? null
-        };
-        session.remoteCandidates.push(item);
-      }
-    }, (err) => {
-      console.error(`[bridge] call=${callId} candidates watch error`, err);
-      scheduleWatcherRetry(session, "candidates", startCandidatesWatch);
-    });
-    session.unsubscribers.push(unsubscribe);
-  };
-
-  startDescriptionWatch();
-  startCandidatesWatch();
-
+  attachSessionListeners(session, db);
   return session;
 }
 
 function closeSession(session) {
   session.closed = true;
-  for (const timer of Object.values(session.retryTimers)) {
-    if (timer) {
-      clearTimeout(timer);
-    }
-  }
-  for (const unsubscribe of session.unsubscribers) {
-    try {
-      unsubscribe();
-    } catch (_) {
-      // no-op
-    }
-  }
-  session.unsubscribers = [];
+  detachSessionListeners(session);
 }
 
 function userSettingsRef(db, ownerUID) {
@@ -895,30 +1007,8 @@ app.get("/session/:callId/remote-candidates", asyncHandler(async (req, res) => {
 
 async function boot() {
   const credentials = await getBridgeCredentials();
-  const firebaseApp = initializeApp(config.firebase);
-  const auth = getAuth(firebaseApp);
-  const functions = getFunctions(firebaseApp, config.turnFunctionRegion);
-  const db = getFirestore(firebaseApp);
-
-  await signInWithEmailAndPassword(auth, credentials.email, credentials.password);
-  const user = auth.currentUser;
-  if (!user) {
-    throw new Error("firebase sign-in succeeded but currentUser is missing");
-  }
-
-  const selfCheckDoc = doc(db, config.callsCollection, "_bridge_healthcheck");
-  try {
-    const snap = await getDoc(selfCheckDoc);
-    console.log(`[bridge] firebase auth ok uid=${user.uid} healthcheck_doc_exists=${snap.exists()}`);
-  } catch (err) {
-    console.warn(`[bridge] firebase auth ok uid=${user.uid}; healthcheck read skipped: ${err.message || String(err)}`);
-  }
-
-  app.locals.db = db;
-  app.locals.functions = functions;
-  app.locals.ownerUID = user.uid;
-  await refreshTurnCredentials(functions);
-  startTurnRefreshLoop(functions);
+  await initializeFirebaseRuntime(credentials);
+  scheduleFirebaseRestart();
   startMlxServer();
   startAgentProcess();
   app.listen(config.port, () => {
@@ -962,6 +1052,8 @@ boot().catch((err) => {
 });
 
 process.on("SIGINT", () => {
+  clearFirebaseRestartTimer();
+  stopTurnRefreshLoop();
   stopAgentProcess();
   stopMlxServer();
   shutdownPeer();
@@ -969,6 +1061,8 @@ process.on("SIGINT", () => {
 });
 
 process.on("SIGTERM", () => {
+  clearFirebaseRestartTimer();
+  stopTurnRefreshLoop();
   stopAgentProcess();
   stopMlxServer();
   shutdownPeer();
