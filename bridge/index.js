@@ -1,6 +1,9 @@
 import express from "express";
 import crypto from "crypto";
+import { spawn } from "child_process";
+import path from "path";
 import { createInterface } from "readline/promises";
+import { fileURLToPath } from "url";
 import { initializeApp } from "firebase/app";
 import {
   getAuth,
@@ -48,6 +51,9 @@ const firebaseConfig = {
   appId: "1:314422729512:web:4fb8cb0278e64a5c374e1d",
 };
 
+const bridgeDir = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(bridgeDir, "..");
+
 const config = {
   firebase: firebaseConfig,
   bridgeEmail: (process.env.BRIDGE_EMAIL || "").trim(),
@@ -58,7 +64,23 @@ const config = {
   turnFunctionName: (process.env.TURN_FUNCTION_NAME || "getTurnCredentials").trim(),
   turnServer: (process.env.TURN_SERVER || "54.37.235.123:3478").trim(),
   turnAuthSecret: (process.env.TURN_AUTH_SECRET || "").trim(),
-  turnTTLSeconds: intEnv("TURN_TTL_SECONDS", 600)
+  turnTTLSeconds: intEnv("TURN_TTL_SECONDS", 86400),
+  turnRefreshIntervalSeconds: intEnv("TURN_REFRESH_INTERVAL_SECONDS", 82800),
+  autoStartPionPeer: (process.env.AUTO_START_PION_PEER || "1").trim() !== "0",
+  pionPeerRole: (process.env.PION_PEER_ROLE || "callee").trim(),
+  pionPeerRestartDelayMs: intEnv("PION_PEER_RESTART_DELAY_MS", 3000)
+};
+
+const turnState = {
+  cachedCredentials: null,
+  refreshPromise: null,
+  refreshTimer: null
+};
+
+const peerState = {
+  process: null,
+  restartTimer: null,
+  shuttingDown: false
 };
 
 async function getBridgeCredentials() {
@@ -118,7 +140,7 @@ function makeTurnCredentials({ peerId, ttlSeconds }) {
   if (!config.turnAuthSecret) {
     throw new Error("TURN_AUTH_SECRET is not configured");
   }
-  const ttl = Math.max(60, Math.min(3600, Number.isFinite(ttlSeconds) ? ttlSeconds : config.turnTTLSeconds));
+  const ttl = Math.max(60, Math.min(86400, Number.isFinite(ttlSeconds) ? ttlSeconds : config.turnTTLSeconds));
   const expiry = Math.floor(Date.now() / 1000) + ttl;
   const username = `${expiry}:${peerId}`;
   const credential = crypto
@@ -142,6 +164,145 @@ async function fetchTurnCredentialsFromFirebase(functions, { ttlSeconds }) {
     turnServer: config.turnServer
   });
   return result.data;
+}
+
+function turnCredentialsAreFresh(credentials, minRemainingSeconds = 120) {
+  if (!credentials?.expiresAtUnix) {
+    return false;
+  }
+  const nowUnix = Math.floor(Date.now() / 1000);
+  return credentials.expiresAtUnix - nowUnix > minRemainingSeconds;
+}
+
+async function refreshTurnCredentials(functions) {
+  if (turnState.refreshPromise) {
+    return turnState.refreshPromise;
+  }
+
+  turnState.refreshPromise = (async () => {
+    const credentials = await fetchTurnCredentialsFromFirebase(functions, {
+      ttlSeconds: config.turnTTLSeconds
+    });
+    turnState.cachedCredentials = credentials;
+    const expiresIn = credentials?.expiresAtUnix
+      ? credentials.expiresAtUnix - Math.floor(Date.now() / 1000)
+      : null;
+    console.log(
+      `[bridge] TURN credentials refreshed${Number.isFinite(expiresIn) ? ` expires_in=${expiresIn}s` : ""}`
+    );
+    return credentials;
+  })();
+
+  try {
+    return await turnState.refreshPromise;
+  } finally {
+    turnState.refreshPromise = null;
+  }
+}
+
+async function getTurnCredentials(functions) {
+  if (turnCredentialsAreFresh(turnState.cachedCredentials)) {
+    return turnState.cachedCredentials;
+  }
+  return refreshTurnCredentials(functions);
+}
+
+function startTurnRefreshLoop(functions) {
+  const intervalMs = Math.max(60, config.turnRefreshIntervalSeconds) * 1000;
+  if (turnState.refreshTimer) {
+    clearInterval(turnState.refreshTimer);
+  }
+  turnState.refreshTimer = setInterval(() => {
+    refreshTurnCredentials(functions).catch((err) => {
+      console.error("[bridge] TURN refresh failed", err);
+    });
+  }, intervalMs);
+}
+
+function prefixStream(stream, prefix) {
+  let buffer = "";
+  stream.on("data", (chunk) => {
+    buffer += chunk.toString();
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (line.length > 0) {
+        console.log(`${prefix} ${line}`);
+      }
+    }
+  });
+  stream.on("end", () => {
+    if (buffer.length > 0) {
+      console.log(`${prefix} ${buffer}`);
+      buffer = "";
+    }
+  });
+}
+
+function clearPeerRestartTimer() {
+  if (peerState.restartTimer) {
+    clearTimeout(peerState.restartTimer);
+    peerState.restartTimer = null;
+  }
+}
+
+function schedulePeerRestart(bridgeURL) {
+  if (peerState.shuttingDown || !config.autoStartPionPeer) {
+    return;
+  }
+  clearPeerRestartTimer();
+  peerState.restartTimer = setTimeout(() => {
+    startPionPeer(bridgeURL);
+  }, Math.max(1000, config.pionPeerRestartDelayMs));
+}
+
+function startPionPeer(bridgeURL) {
+  if (!config.autoStartPionPeer) {
+    return;
+  }
+  if (config.pionPeerRole !== "caller" && config.pionPeerRole !== "callee") {
+    throw new Error("PION_PEER_ROLE must be caller or callee");
+  }
+  if (peerState.process) {
+    return;
+  }
+
+  const args = [
+    "run",
+    "./cmd/pion_bridge_peer",
+    "-role",
+    config.pionPeerRole,
+    "-bridge-url",
+    bridgeURL
+  ];
+  const child = spawn("go", args, {
+    cwd: repoRoot,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  peerState.process = child;
+  console.log(`[bridge] started pion peer role=${config.pionPeerRole}`);
+  prefixStream(child.stdout, "[pion]");
+  prefixStream(child.stderr, "[pion]");
+
+  child.on("error", (err) => {
+    console.error("[bridge] failed to start pion peer", err);
+  });
+
+  child.on("exit", (code, signal) => {
+    peerState.process = null;
+    console.log(`[bridge] pion peer exited code=${code ?? "null"} signal=${signal ?? "null"}`);
+    schedulePeerRestart(bridgeURL);
+  });
+}
+
+function shutdownPeer() {
+  peerState.shuttingDown = true;
+  clearPeerRestartTimer();
+  if (peerState.process) {
+    peerState.process.kill("SIGTERM");
+  }
 }
 
 function makeSession(callId, role, db) {
@@ -429,18 +590,22 @@ async function boot() {
   app.locals.db = db;
   app.locals.functions = functions;
   app.locals.ownerUID = user.uid;
+  await refreshTurnCredentials(functions);
+  startTurnRefreshLoop(functions);
   app.listen(config.port, () => {
-    console.log(`[bridge] listening on http://127.0.0.1:${config.port}`);
+    const bridgeURL = `http://127.0.0.1:${config.port}`;
+    console.log(`[bridge] listening on ${bridgeURL}`);
+    startPionPeer(bridgeURL);
   });
 }
 
 app.post("/turn-credentials", asyncHandler(async (req, res) => {
-  const peerId = String(req.body?.peerId || "").trim() || "peer";
-  const ttlSeconds = Number.parseInt(String(req.body?.ttlSeconds || ""), 10);
   try {
-    const creds = await fetchTurnCredentialsFromFirebase(req.app.locals.functions, { peerId, ttlSeconds });
+    const creds = await getTurnCredentials(req.app.locals.functions);
     return res.json(creds);
   } catch (err) {
+    const peerId = String(req.body?.peerId || "").trim() || "peer";
+    const ttlSeconds = Number.parseInt(String(req.body?.ttlSeconds || ""), 10);
     if (config.turnAuthSecret) {
       try {
         const fallbackCreds = makeTurnCredentials({ peerId, ttlSeconds });
@@ -465,4 +630,14 @@ app.use((err, _req, res, _next) => {
 boot().catch((err) => {
   console.error("[bridge] fatal", err);
   process.exit(1);
+});
+
+process.on("SIGINT", () => {
+  shutdownPeer();
+  process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+  shutdownPeer();
+  process.exit(0);
 });

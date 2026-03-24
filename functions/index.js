@@ -6,7 +6,7 @@ const { defineSecret, defineString } = require("firebase-functions/params");
 
 const TURN_AUTH_SECRET = defineSecret("TURN_AUTH_SECRET");
 const TURN_SERVER = defineString("TURN_SERVER", { default: "54.37.235.123:3478" });
-const TURN_TTL_SECONDS = defineString("TURN_TTL_SECONDS", { default: "600" });
+const TURN_TTL_SECONDS = defineString("TURN_TTL_SECONDS", { default: "86400" });
 
 exports.getTurnCredentials = onCall(
   { region: "europe-west1", secrets: [TURN_AUTH_SECRET] },
@@ -26,8 +26,8 @@ exports.getTurnCredentials = onCall(
     const defaultTTL = Number.parseInt(TURN_TTL_SECONDS.value(), 10);
     const requestedTTL = Number.parseInt(String(request.data?.ttlSeconds ?? ""), 10);
     let ttlSeconds = Number.isFinite(requestedTTL) ? requestedTTL : defaultTTL;
-    if (!Number.isFinite(ttlSeconds)) ttlSeconds = 600;
-    ttlSeconds = Math.min(Math.max(ttlSeconds, 60), 3600);
+    if (!Number.isFinite(ttlSeconds)) ttlSeconds = 86400;
+    ttlSeconds = Math.min(Math.max(ttlSeconds, 60), 86400);
 
     const unixExpiry = Math.floor(Date.now() / 1000) + ttlSeconds;
     const username = `${unixExpiry}:${uid}`;

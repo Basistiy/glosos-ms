@@ -114,7 +114,7 @@ func main() {
 	turnCreds := turnCredentialsResponse{}
 	if err := postJSON(client, config.bridgeURL+"/turn-credentials", map[string]any{
 		"peerId":     config.peerID,
-		"ttlSeconds": 600,
+		"ttlSeconds": 86400,
 	}, &turnCreds); err != nil {
 		log.Printf("turn credentials unavailable, fallback to stun only: %v", err)
 	}
@@ -158,9 +158,16 @@ func main() {
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("peer state: %s", state.String())
+		switch state {
+		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
+			stop()
+		}
 	})
 	pc.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
 		log.Printf("ice state: %s", state.String())
+		if state == webrtc.ICEConnectionStateClosed {
+			stop()
+		}
 	})
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		log.Printf("incoming data channel: %s", dc.Label())
@@ -369,18 +376,6 @@ func pollRemoteCandidates(
 func wireDC(dc *webrtc.DataChannel) {
 	dc.OnOpen(func() {
 		log.Printf("data channel open: %s", dc.Label())
-		go func() {
-			ticker := time.NewTicker(5 * time.Second)
-			defer ticker.Stop()
-			for range ticker.C {
-				msg := fmt.Sprintf("go-%d", time.Now().Unix())
-				if err := dc.SendText(msg); err != nil {
-					log.Printf("send error: %v", err)
-					return
-				}
-				log.Printf("sent: %s", msg)
-			}
-		}()
 	})
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
 		log.Printf("recv: %s", string(msg.Data))
