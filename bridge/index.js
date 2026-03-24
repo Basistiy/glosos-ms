@@ -1,6 +1,6 @@
 import express from "express";
 import crypto from "crypto";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import path from "path";
 import { createInterface } from "readline/promises";
 import { fileURLToPath } from "url";
@@ -68,7 +68,13 @@ const config = {
   turnRefreshIntervalSeconds: intEnv("TURN_REFRESH_INTERVAL_SECONDS", 82800),
   autoStartPionPeer: (process.env.AUTO_START_PION_PEER || "1").trim() !== "0",
   pionPeerRole: (process.env.PION_PEER_ROLE || "callee").trim(),
-  pionPeerRestartDelayMs: intEnv("PION_PEER_RESTART_DELAY_MS", 3000)
+  pionPeerRestartDelayMs: intEnv("PION_PEER_RESTART_DELAY_MS", 3000),
+  autoStartAgent: (process.env.AUTO_START_AGENT || "1").trim() !== "0",
+  agentRunnerCommand: (process.env.AGENT_RUNNER_COMMAND || "uv").trim(),
+  agentRestartDelayMs: intEnv("AGENT_RESTART_DELAY_MS", 3000),
+  agentRequiredImports: (process.env.AGENT_REQUIRED_IMPORTS || "smolagents,mlx_lm").split(",")
+    .map((item) => item.trim())
+    .filter(Boolean)
 };
 
 const turnState = {
@@ -81,6 +87,15 @@ const peerState = {
   process: null,
   restartTimer: null,
   shuttingDown: false
+};
+
+const agentState = {
+  process: null,
+  restartTimer: null,
+  shuttingDown: false,
+  lineBuffer: "",
+  nextRequestID: 1,
+  pending: new Map()
 };
 
 async function getBridgeCredentials() {
@@ -305,6 +320,180 @@ function shutdownPeer() {
   }
 }
 
+function clearAgentRestartTimer() {
+  if (agentState.restartTimer) {
+    clearTimeout(agentState.restartTimer);
+    agentState.restartTimer = null;
+  }
+}
+
+function ensureAgentRuntimeReady() {
+  const runnerCheck = spawnSync(config.agentRunnerCommand, ["--version"], {
+    cwd: repoRoot,
+    env: process.env,
+    encoding: "utf8"
+  });
+  if (runnerCheck.error) {
+    throw new Error(
+      `Agent runner '${config.agentRunnerCommand}' is not available: ${runnerCheck.error.message}`
+    );
+  }
+  if (runnerCheck.status !== 0) {
+    throw new Error(
+      `Agent runner '${config.agentRunnerCommand}' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
+    );
+  }
+
+  if (config.agentRequiredImports.length === 0) {
+    return;
+  }
+
+  const importScript = config.agentRequiredImports.map((name) => `import ${name}`).join("; ");
+  const importCheck = spawnSync(config.agentRunnerCommand, ["run", "python", "-c", importScript], {
+    cwd: repoRoot,
+    env: process.env,
+    encoding: "utf8"
+  });
+  if (importCheck.error) {
+    throw new Error(`Agent dependency check failed: ${importCheck.error.message}`);
+  }
+  if (importCheck.status !== 0) {
+    throw new Error(
+      `Missing Python dependencies for agent: ${config.agentRequiredImports.join(", ")}. ` +
+      `Run 'uv sync' in ${repoRoot}. Details: ${importCheck.stderr || importCheck.stdout}`
+    );
+  }
+}
+
+function scheduleAgentRestart() {
+  if (agentState.shuttingDown || !config.autoStartAgent) {
+    return;
+  }
+  clearAgentRestartTimer();
+  agentState.restartTimer = setTimeout(() => {
+    startAgentProcess();
+  }, Math.max(1000, config.agentRestartDelayMs));
+}
+
+function rejectPendingAgentRequests(message) {
+  for (const { reject } of agentState.pending.values()) {
+    reject(new Error(message));
+  }
+  agentState.pending.clear();
+}
+
+function handleAgentStdout(chunk) {
+  agentState.lineBuffer += chunk.toString();
+  const lines = agentState.lineBuffer.split(/\r?\n/);
+  agentState.lineBuffer = lines.pop() || "";
+
+  for (const line of lines) {
+    if (!line.trim()) {
+      continue;
+    }
+    let payload;
+    try {
+      payload = JSON.parse(line);
+    } catch (err) {
+      console.log(`[agent] ${line}`);
+      continue;
+    }
+
+    const requestID = payload?.id;
+    if (!requestID || !agentState.pending.has(requestID)) {
+      console.log(`[agent] unexpected response ${line}`);
+      continue;
+    }
+
+    const pending = agentState.pending.get(requestID);
+    agentState.pending.delete(requestID);
+    if (payload.error) {
+      pending.reject(new Error(payload.error));
+      continue;
+    }
+    pending.resolve(String(payload.response ?? ""));
+  }
+}
+
+function startAgentProcess() {
+  if (!config.autoStartAgent || agentState.process) {
+    return;
+  }
+
+  ensureAgentRuntimeReady();
+
+  const args = ["run", "agent.py", "--stdio"];
+  const child = spawn(config.agentRunnerCommand, args, {
+    cwd: repoRoot,
+    env: process.env,
+    stdio: ["pipe", "pipe", "pipe"]
+  });
+
+  agentState.process = child;
+  agentState.lineBuffer = "";
+  console.log("[bridge] started agent process");
+
+  child.stdout.on("data", handleAgentStdout);
+  prefixStream(child.stderr, "[agent]");
+
+  child.on("error", (err) => {
+    console.error("[bridge] failed to start agent", err);
+  });
+
+  child.on("exit", (code, signal) => {
+    agentState.process = null;
+    rejectPendingAgentRequests("agent process exited");
+    console.log(`[bridge] agent exited code=${code ?? "null"} signal=${signal ?? "null"}`);
+    scheduleAgentRestart();
+  });
+}
+
+function stopAgentProcess() {
+  agentState.shuttingDown = true;
+  clearAgentRestartTimer();
+  if (agentState.process) {
+    agentState.process.kill("SIGTERM");
+  }
+}
+
+async function chatWithAgent(message, { reset = false } = {}) {
+  if (!message.trim()) {
+    throw new Error("message is required");
+  }
+  if (!agentState.process || !agentState.process.stdin || agentState.process.killed) {
+    throw new Error("agent process is not running");
+  }
+
+  const id = `req-${agentState.nextRequestID++}`;
+  const payload = JSON.stringify({ id, message, reset });
+
+  return new Promise((resolve, reject) => {
+    agentState.pending.set(id, { resolve, reject });
+    agentState.process.stdin.write(`${payload}\n`, (err) => {
+      if (!err) {
+        return;
+      }
+      agentState.pending.delete(id);
+      reject(err);
+    });
+  });
+}
+
+function scheduleWatcherRetry(session, watchName, startWatch) {
+  if (session.closed) {
+    return;
+  }
+  if (session.retryTimers[watchName]) {
+    return;
+  }
+  session.retryTimers[watchName] = setTimeout(() => {
+    session.retryTimers[watchName] = null;
+    if (!session.closed) {
+      startWatch();
+    }
+  }, 2000);
+}
+
 function makeSession(callId, role, db) {
   const callRef = doc(db, config.callsCollection, callId);
   const callerCandidatesRef = collection(callRef, "callerCandidates");
@@ -321,14 +510,16 @@ function makeSession(callId, role, db) {
     remoteCandidates: [],
     nextCandidateID: 1,
     unsubscribers: [],
-    startedAt: Date.now()
+    retryTimers: {},
+    startedAt: Date.now(),
+    closed: false
   };
 
   const remoteDescriptionField = role === "caller" ? "answer" : "offer";
   const remoteCandidatesRef = role === "caller" ? calleeCandidatesRef : callerCandidatesRef;
 
-  session.unsubscribers.push(
-    onSnapshot(callRef, (snap) => {
+  const startDescriptionWatch = () => {
+    const unsubscribe = onSnapshot(callRef, (snap) => {
       if (!snap.exists()) return;
       const data = snap.data() || {};
       const desc = data[remoteDescriptionField];
@@ -341,11 +532,13 @@ function makeSession(callId, role, db) {
       );
     }, (err) => {
       console.error(`[bridge] call=${callId} doc watch error`, err);
-    })
-  );
+      scheduleWatcherRetry(session, "description", startDescriptionWatch);
+    });
+    session.unsubscribers.push(unsubscribe);
+  };
 
-  session.unsubscribers.push(
-    onSnapshot(remoteCandidatesRef, (snap) => {
+  const startCandidatesWatch = () => {
+    const unsubscribe = onSnapshot(remoteCandidatesRef, (snap) => {
       for (const change of snap.docChanges()) {
         if (change.type !== "added") continue;
         const data = change.doc.data();
@@ -365,13 +558,24 @@ function makeSession(callId, role, db) {
       }
     }, (err) => {
       console.error(`[bridge] call=${callId} candidates watch error`, err);
-    })
-  );
+      scheduleWatcherRetry(session, "candidates", startCandidatesWatch);
+    });
+    session.unsubscribers.push(unsubscribe);
+  };
+
+  startDescriptionWatch();
+  startCandidatesWatch();
 
   return session;
 }
 
 function closeSession(session) {
+  session.closed = true;
+  for (const timer of Object.values(session.retryTimers)) {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
   for (const unsubscribe of session.unsubscribers) {
     try {
       unsubscribe();
@@ -415,6 +619,13 @@ function asyncHandler(fn) {
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
+
+app.post("/agent/chat", asyncHandler(async (req, res) => {
+  const message = String(req.body?.message || "").trim();
+  const reset = Boolean(req.body?.reset);
+  const response = await chatWithAgent(message, { reset });
+  return res.json({ response });
+}));
 
 app.post("/session/start", asyncHandler(async (req, res) => {
   const callId = String(req.body?.callId || "").trim();
@@ -592,6 +803,7 @@ async function boot() {
   app.locals.ownerUID = user.uid;
   await refreshTurnCredentials(functions);
   startTurnRefreshLoop(functions);
+  startAgentProcess();
   app.listen(config.port, () => {
     const bridgeURL = `http://127.0.0.1:${config.port}`;
     console.log(`[bridge] listening on ${bridgeURL}`);
@@ -633,11 +845,13 @@ boot().catch((err) => {
 });
 
 process.on("SIGINT", () => {
+  stopAgentProcess();
   shutdownPeer();
   process.exit(0);
 });
 
 process.on("SIGTERM", () => {
+  stopAgentProcess();
   shutdownPeer();
   process.exit(0);
 });

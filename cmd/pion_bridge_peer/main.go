@@ -53,6 +53,10 @@ type turnCredentialsResponse struct {
 	ExpiresAtUnix int64  `json:"expiresAtUnix"`
 }
 
+type agentChatResponse struct {
+	Response string `json:"response"`
+}
+
 type pendingCandidate struct {
 	Candidate        string
 	SDPMid           *string
@@ -110,6 +114,7 @@ func main() {
 	defer stop()
 
 	client := &http.Client{Timeout: 20 * time.Second}
+	agentClient := &http.Client{Timeout: 2 * time.Minute}
 
 	turnCreds := turnCredentialsResponse{}
 	if err := postJSON(client, config.bridgeURL+"/turn-credentials", map[string]any{
@@ -171,7 +176,7 @@ func main() {
 	})
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		log.Printf("incoming data channel: %s", dc.Label())
-		wireDC(dc)
+		wireDC(agentClient, config, dc)
 	})
 
 	var (
@@ -237,7 +242,7 @@ func main() {
 		if dcErr != nil {
 			log.Fatalf("create data channel: %v", dcErr)
 		}
-		wireDC(dc)
+		wireDC(agentClient, config, dc)
 
 		offer, offerErr := pc.CreateOffer(nil)
 		if offerErr != nil {
@@ -373,12 +378,32 @@ func pollRemoteCandidates(
 	}
 }
 
-func wireDC(dc *webrtc.DataChannel) {
+func wireDC(client *http.Client, config cfg, dc *webrtc.DataChannel) {
 	dc.OnOpen(func() {
 		log.Printf("data channel open: %s", dc.Label())
 	})
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		log.Printf("recv: %s", string(msg.Data))
+		userText := string(msg.Data)
+		log.Printf("recv: %s", userText)
+
+		go func() {
+			resp := agentChatResponse{}
+			err := postJSON(client, config.bridgeURL+"/agent/chat", map[string]any{
+				"message": userText,
+			}, &resp)
+			if err != nil {
+				log.Printf("agent request error: %v", err)
+				return
+			}
+			if resp.Response == "" {
+				return
+			}
+			if sendErr := dc.SendText(resp.Response); sendErr != nil {
+				log.Printf("agent send error: %v", sendErr)
+				return
+			}
+			log.Printf("sent agent response")
+		}()
 	})
 	dc.OnClose(func() {
 		log.Printf("data channel closed")

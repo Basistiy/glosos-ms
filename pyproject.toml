@@ -1,0 +1,9 @@
+[project]
+name = "glosos-ms-agent"
+version = "0.1.0"
+description = "Local bridge-managed agent runtime for glosos-ms"
+requires-python = ">=3.10"
+dependencies = [
+  "mlx-lm",
+  "smolagents[openai]",
+]
