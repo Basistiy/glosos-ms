@@ -1,10 +1,15 @@
 import express from "express";
 import crypto from "crypto";
+import { createInterface } from "readline/promises";
 import { initializeApp } from "firebase/app";
 import {
   getAuth,
   signInWithEmailAndPassword
 } from "firebase/auth";
+import {
+  getFunctions,
+  httpsCallable
+} from "firebase/functions";
 import {
   getFirestore,
   addDoc,
@@ -34,23 +39,61 @@ function intEnv(name, fallback) {
   return parsed;
 }
 
+const firebaseConfig = {
+  apiKey: "AIzaSyA1iO6LzNaq9dwPb71m014p29_lUHwnkbs",
+  authDomain: "glosos-103f7.firebaseapp.com",
+  projectId: "glosos-103f7",
+  storageBucket: "glosos-103f7.firebasestorage.app",
+  messagingSenderId: "314422729512",
+  appId: "1:314422729512:web:4fb8cb0278e64a5c374e1d",
+};
+
 const config = {
-  firebase: {
-    apiKey: mustEnv("FIREBASE_API_KEY"),
-    authDomain: mustEnv("FIREBASE_AUTH_DOMAIN"),
-    projectId: mustEnv("FIREBASE_PROJECT_ID"),
-    storageBucket: process.env.FIREBASE_STORAGE_BUCKET || undefined,
-    messagingSenderId: process.env.FIREBASE_MESSAGING_SENDER_ID || undefined,
-    appId: process.env.FIREBASE_APP_ID || undefined
-  },
-  bridgeEmail: mustEnv("BRIDGE_EMAIL"),
-  bridgePassword: mustEnv("BRIDGE_PASSWORD"),
+  firebase: firebaseConfig,
+  bridgeEmail: (process.env.BRIDGE_EMAIL || "").trim(),
+  bridgePassword: (process.env.BRIDGE_PASSWORD || "").trim(),
   callsCollection: (process.env.WEBRTC_CALLS_COLLECTION || "webrtc_calls").trim(),
   port: intEnv("BRIDGE_PORT", 8080),
+  turnFunctionRegion: (process.env.TURN_FUNCTION_REGION || "europe-west1").trim(),
+  turnFunctionName: (process.env.TURN_FUNCTION_NAME || "getTurnCredentials").trim(),
   turnServer: (process.env.TURN_SERVER || "54.37.235.123:3478").trim(),
   turnAuthSecret: (process.env.TURN_AUTH_SECRET || "").trim(),
   turnTTLSeconds: intEnv("TURN_TTL_SECONDS", 600)
 };
+
+async function getBridgeCredentials() {
+  let email = config.bridgeEmail;
+  let password = config.bridgePassword;
+
+  if (email && password) {
+    return { email, password };
+  }
+
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout
+  });
+
+  try {
+    if (!email) {
+      email = (await rl.question("Firebase user email: ")).trim();
+    }
+    if (!password) {
+      password = (await rl.question("Firebase password: ")).trim();
+    }
+  } finally {
+    rl.close();
+  }
+
+  if (!email) {
+    throw new Error("Firebase user email is required");
+  }
+  if (!password) {
+    throw new Error("Firebase password is required");
+  }
+
+  return { email, password };
+}
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
@@ -90,6 +133,15 @@ function makeTurnCredentials({ peerId, ttlSeconds }) {
     ttlSeconds: ttl,
     expiresAtUnix: expiry
   };
+}
+
+async function fetchTurnCredentialsFromFirebase(functions, { ttlSeconds }) {
+  const callable = httpsCallable(functions, config.turnFunctionName);
+  const result = await callable({
+    ttlSeconds,
+    turnServer: config.turnServer
+  });
+  return result.data;
 }
 
 function makeSession(callId, role, db) {
@@ -169,11 +221,41 @@ function closeSession(session) {
   session.unsubscribers = [];
 }
 
+function userSettingsRef(db, ownerUID) {
+  return doc(db, "user_settings", ownerUID);
+}
+
+async function publishActiveCall(db, ownerUID, callId) {
+  if (!ownerUID) {
+    return;
+  }
+  await setDoc(userSettingsRef(db, ownerUID), {
+    activeCallId: callId,
+    activeCallUpdatedAt: serverTimestamp()
+  }, { merge: true });
+}
+
+async function clearActiveCall(db, ownerUID) {
+  if (!ownerUID) {
+    return;
+  }
+  await setDoc(userSettingsRef(db, ownerUID), {
+    activeCallId: deleteField(),
+    activeCallUpdatedAt: serverTimestamp()
+  }, { merge: true });
+}
+
+function asyncHandler(fn) {
+  return (req, res, next) => {
+    Promise.resolve(fn(req, res, next)).catch(next);
+  };
+}
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true });
 });
 
-app.post("/session/start", async (req, res) => {
+app.post("/session/start", asyncHandler(async (req, res) => {
   const callId = String(req.body?.callId || "").trim();
   const role = String(req.body?.role || "").trim();
   if (!callId) {
@@ -212,6 +294,8 @@ app.post("/session/start", async (req, res) => {
     }, { merge: true });
   }
 
+  await publishActiveCall(req.app.locals.db, ownerUID, callId);
+
   const session = makeSession(callId, role, req.app.locals.db);
   sessions.set(callId, session);
 
@@ -220,20 +304,21 @@ app.post("/session/start", async (req, res) => {
     callId,
     role
   });
-});
+}));
 
-app.post("/session/:callId/stop", async (req, res) => {
+app.post("/session/:callId/stop", asyncHandler(async (req, res) => {
   const callId = String(req.params.callId || "").trim();
   const session = sessions.get(callId);
   if (!session) {
     return res.json({ ok: true, alreadyStopped: true });
   }
+  await clearActiveCall(req.app.locals.db, req.app.locals.ownerUID || null);
   closeSession(session);
   sessions.delete(callId);
   return res.json({ ok: true });
-});
+}));
 
-app.post("/session/:callId/local-description", async (req, res) => {
+app.post("/session/:callId/local-description", asyncHandler(async (req, res) => {
   const callId = String(req.params.callId || "").trim();
   const session = sessions.get(callId);
   if (!session) {
@@ -262,9 +347,9 @@ app.post("/session/:callId/local-description", async (req, res) => {
   }
 
   return res.json({ ok: true });
-});
+}));
 
-app.get("/session/:callId/remote-description", async (req, res) => {
+app.get("/session/:callId/remote-description", asyncHandler(async (req, res) => {
   const callId = String(req.params.callId || "").trim();
   const session = sessions.get(callId);
   if (!session) {
@@ -283,9 +368,9 @@ app.get("/session/:callId/remote-description", async (req, res) => {
     version: session.remoteDescriptionVersion,
     description: normalized
   });
-});
+}));
 
-app.post("/session/:callId/local-candidate", async (req, res) => {
+app.post("/session/:callId/local-candidate", asyncHandler(async (req, res) => {
   const callId = String(req.params.callId || "").trim();
   const session = sessions.get(callId);
   if (!session) {
@@ -307,9 +392,9 @@ app.post("/session/:callId/local-candidate", async (req, res) => {
   const targetRef = session.role === "caller" ? session.callerCandidatesRef : session.calleeCandidatesRef;
   await addDoc(targetRef, payload);
   return res.json({ ok: true });
-});
+}));
 
-app.get("/session/:callId/remote-candidates", async (req, res) => {
+app.get("/session/:callId/remote-candidates", asyncHandler(async (req, res) => {
   const callId = String(req.params.callId || "").trim();
   const session = sessions.get(callId);
   if (!session) {
@@ -318,14 +403,16 @@ app.get("/session/:callId/remote-candidates", async (req, res) => {
   const since = Number.parseInt(String(req.query.since || "0"), 10) || 0;
   const items = session.remoteCandidates.filter((item) => item.id > since);
   return res.json({ items });
-});
+}));
 
 async function boot() {
+  const credentials = await getBridgeCredentials();
   const firebaseApp = initializeApp(config.firebase);
   const auth = getAuth(firebaseApp);
+  const functions = getFunctions(firebaseApp, config.turnFunctionRegion);
   const db = getFirestore(firebaseApp);
 
-  await signInWithEmailAndPassword(auth, config.bridgeEmail, config.bridgePassword);
+  await signInWithEmailAndPassword(auth, credentials.email, credentials.password);
   const user = auth.currentUser;
   if (!user) {
     throw new Error("firebase sign-in succeeded but currentUser is missing");
@@ -340,21 +427,39 @@ async function boot() {
   }
 
   app.locals.db = db;
+  app.locals.functions = functions;
   app.locals.ownerUID = user.uid;
   app.listen(config.port, () => {
     console.log(`[bridge] listening on http://127.0.0.1:${config.port}`);
   });
 }
 
-app.post("/turn-credentials", async (req, res) => {
+app.post("/turn-credentials", asyncHandler(async (req, res) => {
   const peerId = String(req.body?.peerId || "").trim() || "peer";
   const ttlSeconds = Number.parseInt(String(req.body?.ttlSeconds || ""), 10);
   try {
-    const creds = makeTurnCredentials({ peerId, ttlSeconds });
+    const creds = await fetchTurnCredentialsFromFirebase(req.app.locals.functions, { peerId, ttlSeconds });
     return res.json(creds);
   } catch (err) {
+    if (config.turnAuthSecret) {
+      try {
+        const fallbackCreds = makeTurnCredentials({ peerId, ttlSeconds });
+        return res.json(fallbackCreds);
+      } catch (_) {
+        // Ignore and return the original Firebase error below.
+      }
+    }
     return res.status(500).json({ error: err.message || String(err) });
   }
+}));
+
+app.use((err, _req, res, _next) => {
+  const message = err?.message || String(err);
+  console.error("[bridge] request error", err);
+  if (res.headersSent) {
+    return;
+  }
+  res.status(500).json({ error: message });
 });
 
 boot().catch((err) => {

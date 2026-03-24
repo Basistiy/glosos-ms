@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -432,20 +433,15 @@ func getJSON(client *http.Client, url string, out any) error {
 }
 
 func loadCfg() cfg {
-	var callID, role, bridgeURL, peerID string
-	flag.StringVar(&callID, "call-id", "", "Call ID")
+	var role, bridgeURL, peerID string
 	flag.StringVar(&role, "role", "callee", "Role: caller or callee")
 	flag.StringVar(&bridgeURL, "bridge-url", "http://127.0.0.1:8080", "Bridge base URL")
 	flag.StringVar(&peerID, "peer-id", "", "Optional peer identifier for TURN username")
 	flag.Parse()
 
-	callID = strings.TrimSpace(callID)
 	role = strings.TrimSpace(role)
 	bridgeURL = strings.TrimRight(strings.TrimSpace(bridgeURL), "/")
 
-	if callID == "" {
-		log.Fatal("-call-id is required")
-	}
 	if role != "caller" && role != "callee" {
 		log.Fatal("-role must be caller or callee")
 	}
@@ -459,15 +455,15 @@ func loadCfg() cfg {
 	if overrideRole := strings.TrimSpace(os.Getenv("PEER_ROLE")); overrideRole != "" {
 		role = overrideRole
 	}
-	if overrideCallID := strings.TrimSpace(os.Getenv("CALL_ID")); overrideCallID != "" {
-		callID = overrideCallID
-	}
 	if overridePeerID := strings.TrimSpace(os.Getenv("PEER_ID")); overridePeerID != "" {
 		peerID = overridePeerID
 	}
 	if peerID == "" {
 		peerID = fmt.Sprintf("%s-%d", role, time.Now().Unix())
 	}
+
+	callID := uuid.NewString()
+	log.Printf("generated call id: %s", callID)
 
 	return cfg{
 		bridgeURL: bridgeURL,
