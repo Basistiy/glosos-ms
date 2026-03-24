@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import crypto from "crypto";
 import { spawn, spawnSync } from "child_process";
@@ -60,6 +61,12 @@ const config = {
   bridgePassword: (process.env.BRIDGE_PASSWORD || "").trim(),
   callsCollection: (process.env.WEBRTC_CALLS_COLLECTION || "webrtc_calls").trim(),
   port: intEnv("BRIDGE_PORT", 8080),
+  autoStartMlxServer: (process.env.AUTO_START_MLX_SERVER || "1").trim() !== "0",
+  mlxRunnerCommand: (process.env.MLX_RUNNER_COMMAND || "uv").trim(),
+  mlxModel: (process.env.MLX_MODEL || "mlx-community/Orchestrator-8B-6bit").trim(),
+  mlxHost: (process.env.MLX_HOST || "127.0.0.1").trim(),
+  mlxPort: intEnv("MLX_PORT", 8000),
+  mlxRestartDelayMs: intEnv("MLX_RESTART_DELAY_MS", 3000),
   turnFunctionRegion: (process.env.TURN_FUNCTION_REGION || "europe-west1").trim(),
   turnFunctionName: (process.env.TURN_FUNCTION_NAME || "getTurnCredentials").trim(),
   turnServer: (process.env.TURN_SERVER || "54.37.235.123:3478").trim(),
@@ -84,6 +91,12 @@ const turnState = {
 };
 
 const peerState = {
+  process: null,
+  restartTimer: null,
+  shuttingDown: false
+};
+
+const mlxState = {
   process: null,
   restartTimer: null,
   shuttingDown: false
@@ -261,6 +274,109 @@ function clearPeerRestartTimer() {
   }
 }
 
+function mlxApiBase() {
+  return `http://${config.mlxHost}:${config.mlxPort}/v1`;
+}
+
+function clearMlxRestartTimer() {
+  if (mlxState.restartTimer) {
+    clearTimeout(mlxState.restartTimer);
+    mlxState.restartTimer = null;
+  }
+}
+
+function ensureMlxRuntimeReady() {
+  const runnerCheck = spawnSync(config.mlxRunnerCommand, ["--version"], {
+    cwd: repoRoot,
+    env: process.env,
+    encoding: "utf8"
+  });
+  if (runnerCheck.error) {
+    throw new Error(
+      `MLX runner '${config.mlxRunnerCommand}' is not available: ${runnerCheck.error.message}`
+    );
+  }
+  if (runnerCheck.status !== 0) {
+    throw new Error(
+      `MLX runner '${config.mlxRunnerCommand}' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
+    );
+  }
+
+  const importCheck = spawnSync(config.mlxRunnerCommand, ["run", "python", "-c", "import mlx_lm"], {
+    cwd: repoRoot,
+    env: process.env,
+    encoding: "utf8"
+  });
+  if (importCheck.error) {
+    throw new Error(`MLX dependency check failed: ${importCheck.error.message}`);
+  }
+  if (importCheck.status !== 0) {
+    throw new Error(
+      `Missing Python dependencies for MLX server. Run 'uv sync' in ${repoRoot}. ` +
+      `Details: ${importCheck.stderr || importCheck.stdout}`
+    );
+  }
+}
+
+function scheduleMlxRestart() {
+  if (mlxState.shuttingDown || !config.autoStartMlxServer) {
+    return;
+  }
+  clearMlxRestartTimer();
+  mlxState.restartTimer = setTimeout(() => {
+    startMlxServer();
+  }, Math.max(1000, config.mlxRestartDelayMs));
+}
+
+function startMlxServer() {
+  if (!config.autoStartMlxServer || mlxState.process) {
+    return;
+  }
+
+  ensureMlxRuntimeReady();
+
+  const args = [
+    "run",
+    "python",
+    "-m",
+    "mlx_lm.server",
+    "--model",
+    config.mlxModel,
+    "--host",
+    config.mlxHost,
+    "--port",
+    String(config.mlxPort)
+  ];
+  const child = spawn(config.mlxRunnerCommand, args, {
+    cwd: repoRoot,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  mlxState.process = child;
+  console.log(`[bridge] started MLX server model=${config.mlxModel} base=${mlxApiBase()}`);
+  prefixStream(child.stdout, "[mlx]");
+  prefixStream(child.stderr, "[mlx]");
+
+  child.on("error", (err) => {
+    console.error("[bridge] failed to start MLX server", err);
+  });
+
+  child.on("exit", (code, signal) => {
+    mlxState.process = null;
+    console.log(`[bridge] MLX server exited code=${code ?? "null"} signal=${signal ?? "null"}`);
+    scheduleMlxRestart();
+  });
+}
+
+function stopMlxServer() {
+  mlxState.shuttingDown = true;
+  clearMlxRestartTimer();
+  if (mlxState.process) {
+    mlxState.process.kill("SIGTERM");
+  }
+}
+
 function schedulePeerRestart(bridgeURL) {
   if (peerState.shuttingDown || !config.autoStartPionPeer) {
     return;
@@ -422,7 +538,7 @@ function startAgentProcess() {
 
   ensureAgentRuntimeReady();
 
-  const args = ["run", "agent.py", "--stdio"];
+  const args = ["run", "agent.py", "--stdio", "--api-base", mlxApiBase(), "--model", config.mlxModel];
   const child = spawn(config.agentRunnerCommand, args, {
     cwd: repoRoot,
     env: process.env,
@@ -803,6 +919,7 @@ async function boot() {
   app.locals.ownerUID = user.uid;
   await refreshTurnCredentials(functions);
   startTurnRefreshLoop(functions);
+  startMlxServer();
   startAgentProcess();
   app.listen(config.port, () => {
     const bridgeURL = `http://127.0.0.1:${config.port}`;
@@ -846,12 +963,14 @@ boot().catch((err) => {
 
 process.on("SIGINT", () => {
   stopAgentProcess();
+  stopMlxServer();
   shutdownPeer();
   process.exit(0);
 });
 
 process.on("SIGTERM", () => {
   stopAgentProcess();
+  stopMlxServer();
   shutdownPeer();
   process.exit(0);
 });
