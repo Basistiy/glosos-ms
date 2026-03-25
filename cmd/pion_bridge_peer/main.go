@@ -63,6 +63,11 @@ type agentChatResponse struct {
 	Response string `json:"response"`
 }
 
+type agentAudioChunkResponse struct {
+	Response          string `json:"response"`
+	AssistantResponse string `json:"assistantResponse"`
+}
+
 type pendingCandidate struct {
 	Candidate        string
 	SDPMid           *string
@@ -79,6 +84,7 @@ type remoteCandidateGate struct {
 
 type liveAudioForwarder struct {
 	client          *http.Client
+	getDC           func() *webrtc.DataChannel
 	bridgeURL       string
 	callID          string
 	outputDir       string
@@ -113,7 +119,7 @@ func newRemoteCandidateGate() *remoteCandidateGate {
 	}
 }
 
-func newLiveAudioForwarder(client *http.Client, config cfg, track *webrtc.TrackRemote) (*liveAudioForwarder, error) {
+func newLiveAudioForwarder(client *http.Client, getDC func() *webrtc.DataChannel, config cfg, track *webrtc.TrackRemote) (*liveAudioForwarder, error) {
 	codec := track.Codec()
 	sampleRate := uint32(codec.ClockRate)
 	if sampleRate == 0 {
@@ -137,6 +143,7 @@ func newLiveAudioForwarder(client *http.Client, config cfg, track *webrtc.TrackR
 
 	return &liveAudioForwarder{
 		client:          client,
+		getDC:           getDC,
 		bridgeURL:       config.bridgeURL,
 		callID:          config.callID,
 		outputDir:       outputDir,
@@ -310,10 +317,25 @@ func (f *liveAudioForwarder) postChunk(audioBytes []byte, seq int, final bool) e
 		"final":       final,
 		"audioBase64": base64.StdEncoding.EncodeToString(audioBytes),
 	}
-	if err := postJSON(f.client, f.bridgeURL+"/agent/audio-chunk", payload, nil); err != nil {
+	resp := agentAudioChunkResponse{}
+	if err := postJSON(f.client, f.bridgeURL+"/agent/audio-chunk", payload, &resp); err != nil {
 		return err
 	}
 	log.Printf("posted audio chunk seq=%d bytes=%d final=%v", seq, len(audioBytes), final)
+	reply := strings.TrimSpace(resp.AssistantResponse)
+	if reply == "" {
+		reply = strings.TrimSpace(resp.Response)
+	}
+	if reply != "" && reply != "audio chunk processed" {
+		dc := f.getDC()
+		if dc == nil {
+			log.Printf("agent send skipped: data channel not ready")
+		} else if sendErr := dc.SendText(reply); sendErr != nil {
+			log.Printf("agent send error: %v", sendErr)
+		} else {
+			log.Printf("sent agent response")
+		}
+	}
 
 	return nil
 }
@@ -325,6 +347,20 @@ func main() {
 
 	client := &http.Client{Timeout: 20 * time.Second}
 	agentClient := &http.Client{Timeout: 2 * time.Minute}
+	var currentDC struct {
+		sync.RWMutex
+		value *webrtc.DataChannel
+	}
+	getCurrentDC := func() *webrtc.DataChannel {
+		currentDC.RLock()
+		defer currentDC.RUnlock()
+		return currentDC.value
+	}
+	setCurrentDC := func(dc *webrtc.DataChannel) {
+		currentDC.Lock()
+		defer currentDC.Unlock()
+		currentDC.value = dc
+	}
 
 	turnCreds := turnCredentialsResponse{}
 	if err := postJSON(client, config.bridgeURL+"/turn-credentials", map[string]any{
@@ -386,6 +422,7 @@ func main() {
 	})
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		log.Printf("incoming data channel: %s", dc.Label())
+		setCurrentDC(dc)
 		wireDC(agentClient, config, dc)
 	})
 	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -409,7 +446,7 @@ func main() {
 			return
 		}
 
-		forwarder, err := newLiveAudioForwarder(client, config, track)
+		forwarder, err := newLiveAudioForwarder(client, getCurrentDC, config, track)
 		if err != nil {
 			log.Printf("create live audio forwarder error: %v", err)
 			return
@@ -480,6 +517,7 @@ func main() {
 		if dcErr != nil {
 			log.Fatalf("create data channel: %v", dcErr)
 		}
+		setCurrentDC(dc)
 		wireDC(agentClient, config, dc)
 
 		offer, offerErr := pc.CreateOffer(nil)

@@ -15,6 +15,13 @@ from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
+from stt_provider import (
+    DEFAULT_STT_API_KEY,
+    DEFAULT_STT_BASE_URL,
+    DEFAULT_STT_MODEL,
+    DEFAULT_STT_PROVIDER,
+    create_transcription_provider,
+)
 
 DEFAULT_MODEL = "mlx-community/Orchestrator-8B-6bit"
 DEFAULT_API_BASE = "http://127.0.0.1:8000/v1"
@@ -65,6 +72,62 @@ def build_parser() -> argparse.ArgumentParser:
         default=2,
         help="How many consecutive silent chunks end the active speech segment",
     )
+    parser.add_argument(
+        "--stt-provider",
+        default=DEFAULT_STT_PROVIDER,
+        help="Speech-to-text provider to use: mlx_audio or google",
+    )
+    parser.add_argument(
+        "--stt-base-url",
+        default=DEFAULT_STT_BASE_URL,
+        help="Base URL for an OpenAI-compatible STT server such as mlx-audio",
+    )
+    parser.add_argument(
+        "--stt-api-key",
+        default=DEFAULT_STT_API_KEY,
+        help="API key for an OpenAI-compatible STT server",
+    )
+    parser.add_argument(
+        "--stt-model",
+        default=DEFAULT_STT_MODEL,
+        help="Speech-to-text model identifier",
+    )
+    parser.add_argument(
+        "--stt-language",
+        default="",
+        help="Optional language hint passed to the STT provider",
+    )
+    parser.add_argument(
+        "--google-stt-project-id",
+        default="",
+        help="Google Cloud project id used when stt_provider=google",
+    )
+    parser.add_argument(
+        "--google-stt-location",
+        default="global",
+        help="Google Cloud Speech location used when stt_provider=google",
+    )
+    parser.add_argument(
+        "--google-stt-recognizer",
+        default="_",
+        help="Google Cloud Speech recognizer id used when stt_provider=google",
+    )
+    parser.add_argument(
+        "--google-stt-model",
+        default="",
+        help="Optional Google Cloud Speech model name",
+    )
+    parser.add_argument(
+        "--disable-audio-transcription",
+        action="store_true",
+        help="Disable speech-to-text for saved speech chunks",
+    )
+    parser.add_argument(
+        "--transcription-model",
+        dest="stt_model",
+        default=argparse.SUPPRESS,
+        help="Deprecated alias for --stt-model",
+    )
     return parser
 
 
@@ -114,6 +177,10 @@ def run_turn(
     reply = complete_chat(client, model, messages)
     messages.append({"role": "assistant", "content": reply})
     return reply
+
+
+def build_audio_user_text(transcript: str) -> str:
+    return f"Transcribed user speech:\n{transcript.strip()}"
 
 
 class SpeechChunkRecorder:
@@ -319,6 +386,11 @@ def run_stdio(args: argparse.Namespace) -> None:
         target_rate=args.vad_target_rate,
         min_silence_chunks=args.vad_min_silence_chunks,
     )
+    transcription_provider = create_transcription_provider(args)
+    if transcription_provider:
+        print("[audio] warming transcription provider", file=sys.stderr)
+        transcription_provider.warmup()
+        print("[audio] transcription provider ready", file=sys.stderr)
 
     for raw_line in sys.stdin:
         raw_line = raw_line.strip()
@@ -359,6 +431,27 @@ def run_stdio(args: argparse.Namespace) -> None:
                         audio_bytes=base64.b64decode(audio_base64),
                     ),
                 }
+                response["audioResponse"] = response.get("response", "")
+                if transcription_provider and response.get("savedPaths"):
+                    transcripts: list[dict[str, Any]] = []
+                    transcript_texts: list[str] = []
+                    for saved_path in response["savedPaths"]:
+                        result = transcription_provider.transcribe_file(str(saved_path))
+                        transcripts.append(result.to_dict())
+                        if result.text:
+                            transcript_texts.append(result.text)
+                    response["transcriptions"] = transcripts
+                    if transcript_texts:
+                        response["transcriptText"] = "\n\n".join(transcript_texts)
+                        response["assistantResponse"] = run_turn(
+                            client,
+                            args.model,
+                            messages,
+                            build_audio_user_text(response["transcriptText"]),
+                        )
+                        # Mirror the text-chat contract so callers can handle
+                        # typed and transcribed input through the same field.
+                        response["response"] = response["assistantResponse"]
             else:
                 raise ValueError(f"unsupported request type: {request_type}")
         except Exception as exc:  # pylint: disable=broad-except

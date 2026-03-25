@@ -69,6 +69,11 @@ const config = {
   mlxHost: (process.env.MLX_HOST || "127.0.0.1").trim(),
   mlxPort: intEnv("MLX_PORT", 8000),
   mlxRestartDelayMs: intEnv("MLX_RESTART_DELAY_MS", 3000),
+  autoStartMlxAudioServer: (process.env.AUTO_START_MLX_AUDIO_SERVER || "1").trim() !== "0",
+  mlxAudioRunnerCommand: (process.env.MLX_AUDIO_RUNNER_COMMAND || "uv").trim(),
+  mlxAudioHost: (process.env.MLX_AUDIO_HOST || "127.0.0.1").trim(),
+  mlxAudioPort: intEnv("MLX_AUDIO_PORT", 8001),
+  mlxAudioRestartDelayMs: intEnv("MLX_AUDIO_RESTART_DELAY_MS", 3000),
   turnFunctionRegion: (process.env.TURN_FUNCTION_REGION || "europe-west1").trim(),
   turnFunctionName: (process.env.TURN_FUNCTION_NAME || "getTurnCredentials").trim(),
   turnServer: (process.env.TURN_SERVER || "54.37.235.123:3478").trim(),
@@ -81,6 +86,16 @@ const config = {
   autoStartAgent: (process.env.AUTO_START_AGENT || "1").trim() !== "0",
   agentRunnerCommand: (process.env.AGENT_RUNNER_COMMAND || "uv").trim(),
   agentAudioOutputDir: (process.env.AGENT_AUDIO_OUTPUT_DIR || "agent_recordings").trim(),
+  agentSttProvider: (process.env.AGENT_STT_PROVIDER || "mlx_audio").trim(),
+  agentSttBaseUrl: (process.env.AGENT_STT_BASE_URL || "").trim(),
+  agentSttApiKey: (process.env.AGENT_STT_API_KEY || "mlx-audio").trim(),
+  agentSttModel: (process.env.AGENT_STT_MODEL || "mlx-community/whisper-large-v3-turbo-asr-fp16").trim(),
+  agentSttLanguage: (process.env.AGENT_STT_LANGUAGE || "").trim(),
+  googleSttProjectId: (process.env.GOOGLE_STT_PROJECT_ID || "").trim(),
+  googleSttLocation: (process.env.GOOGLE_STT_LOCATION || "global").trim(),
+  googleSttRecognizer: (process.env.GOOGLE_STT_RECOGNIZER || "_").trim(),
+  googleSttModel: (process.env.GOOGLE_STT_MODEL || "").trim(),
+  agentDisableAudioTranscription: (process.env.AGENT_DISABLE_AUDIO_TRANSCRIPTION || "0").trim() === "1",
   agentRestartDelayMs: intEnv("AGENT_RESTART_DELAY_MS", 3000),
   agentRequiredImports: (process.env.AGENT_REQUIRED_IMPORTS || "smolagents,mlx_lm,av,torch,silero_vad").split(",")
     .map((item) => item.trim())
@@ -105,6 +120,12 @@ const mlxState = {
   shuttingDown: false
 };
 
+const mlxAudioState = {
+  process: null,
+  restartTimer: null,
+  shuttingDown: false
+};
+
 const agentState = {
   process: null,
   restartTimer: null,
@@ -112,6 +133,10 @@ const agentState = {
   lineBuffer: "",
   nextRequestID: 1,
   pending: new Map()
+};
+
+const agentAudioState = {
+  latestByCallId: new Map()
 };
 
 const firebaseState = {
@@ -288,6 +313,10 @@ function prefixStream(stream, prefix) {
   });
 }
 
+function resolvedAgentSttBaseUrl() {
+  return config.agentSttBaseUrl || mlxAudioApiBase();
+}
+
 function clearPeerRestartTimer() {
   if (peerState.restartTimer) {
     clearTimeout(peerState.restartTimer);
@@ -306,10 +335,21 @@ function mlxApiBase() {
   return `http://${config.mlxHost}:${config.mlxPort}/v1`;
 }
 
+function mlxAudioApiBase() {
+  return `http://${config.mlxAudioHost}:${config.mlxAudioPort}/v1`;
+}
+
 function clearMlxRestartTimer() {
   if (mlxState.restartTimer) {
     clearTimeout(mlxState.restartTimer);
     mlxState.restartTimer = null;
+  }
+}
+
+function clearMlxAudioRestartTimer() {
+  if (mlxAudioState.restartTimer) {
+    clearTimeout(mlxAudioState.restartTimer);
+    mlxAudioState.restartTimer = null;
   }
 }
 
@@ -346,6 +386,43 @@ function ensureMlxRuntimeReady() {
   }
 }
 
+function ensureMlxAudioRuntimeReady() {
+  const runnerCheck = spawnSync(config.mlxAudioRunnerCommand, ["--version"], {
+    cwd: repoRoot,
+    env: process.env,
+    encoding: "utf8"
+  });
+  if (runnerCheck.error) {
+    throw new Error(
+      `MLX audio runner '${config.mlxAudioRunnerCommand}' is not available: ${runnerCheck.error.message}`
+    );
+  }
+  if (runnerCheck.status !== 0) {
+    throw new Error(
+      `MLX audio runner '${config.mlxAudioRunnerCommand}' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
+    );
+  }
+
+  const importCheck = spawnSync(
+    config.mlxAudioRunnerCommand,
+    ["run", "python", "-c", "import mlx_audio, uvicorn, fastapi, webrtcvad, multipart"],
+    {
+      cwd: repoRoot,
+      env: process.env,
+      encoding: "utf8"
+    }
+  );
+  if (importCheck.error) {
+    throw new Error(`MLX audio dependency check failed: ${importCheck.error.message}`);
+  }
+  if (importCheck.status !== 0) {
+    throw new Error(
+      `Missing Python dependencies for MLX audio server. Run 'uv sync' in ${repoRoot}. ` +
+      `Details: ${importCheck.stderr || importCheck.stdout}`
+    );
+  }
+}
+
 function scheduleMlxRestart() {
   if (mlxState.shuttingDown || !config.autoStartMlxServer) {
     return;
@@ -354,6 +431,16 @@ function scheduleMlxRestart() {
   mlxState.restartTimer = setTimeout(() => {
     startMlxServer();
   }, Math.max(1000, config.mlxRestartDelayMs));
+}
+
+function scheduleMlxAudioRestart() {
+  if (mlxAudioState.shuttingDown || !config.autoStartMlxAudioServer || config.agentSttProvider !== "mlx_audio") {
+    return;
+  }
+  clearMlxAudioRestartTimer();
+  mlxAudioState.restartTimer = setTimeout(() => {
+    startMlxAudioServer();
+  }, Math.max(1000, config.mlxAudioRestartDelayMs));
 }
 
 function startMlxServer() {
@@ -397,11 +484,58 @@ function startMlxServer() {
   });
 }
 
+function startMlxAudioServer() {
+  if (!config.autoStartMlxAudioServer || config.agentSttProvider !== "mlx_audio" || mlxAudioState.process) {
+    return;
+  }
+
+  ensureMlxAudioRuntimeReady();
+
+  const args = [
+    "run",
+    "python",
+    "-m",
+    "mlx_audio.server",
+    "--host",
+    config.mlxAudioHost,
+    "--port",
+    String(config.mlxAudioPort)
+  ];
+  const child = spawn(config.mlxAudioRunnerCommand, args, {
+    cwd: repoRoot,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  mlxAudioState.process = child;
+  console.log(`[bridge] started MLX audio server base=${mlxAudioApiBase()}`);
+  prefixStream(child.stdout, "[mlx-audio]");
+  prefixStream(child.stderr, "[mlx-audio]");
+
+  child.on("error", (err) => {
+    console.error("[bridge] failed to start MLX audio server", err);
+  });
+
+  child.on("exit", (code, signal) => {
+    mlxAudioState.process = null;
+    console.log(`[bridge] MLX audio server exited code=${code ?? "null"} signal=${signal ?? "null"}`);
+    scheduleMlxAudioRestart();
+  });
+}
+
 function stopMlxServer() {
   mlxState.shuttingDown = true;
   clearMlxRestartTimer();
   if (mlxState.process) {
     mlxState.process.kill("SIGTERM");
+  }
+}
+
+function stopMlxAudioServer() {
+  mlxAudioState.shuttingDown = true;
+  clearMlxAudioRestartTimer();
+  if (mlxAudioState.process) {
+    mlxAudioState.process.kill("SIGTERM");
   }
 }
 
@@ -488,11 +622,18 @@ function ensureAgentRuntimeReady() {
     );
   }
 
-  if (config.agentRequiredImports.length === 0) {
+  const requiredImports = [...config.agentRequiredImports];
+  if (!config.agentDisableAudioTranscription) {
+    if (config.agentSttProvider === "google") {
+      requiredImports.push("google.cloud.speech_v2");
+    }
+  }
+
+  if (requiredImports.length === 0) {
     return;
   }
 
-  const importScript = config.agentRequiredImports.map((name) => `import ${name}`).join("; ");
+  const importScript = requiredImports.map((name) => `import ${name}`).join("; ");
   const importCheck = spawnSync(config.agentRunnerCommand, ["run", "python", "-c", importScript], {
     cwd: repoRoot,
     env: process.env,
@@ -503,7 +644,7 @@ function ensureAgentRuntimeReady() {
   }
   if (importCheck.status !== 0) {
     throw new Error(
-      `Missing Python dependencies for agent: ${config.agentRequiredImports.join(", ")}. ` +
+      `Missing Python dependencies for agent: ${requiredImports.join(", ")}. ` +
       `Run 'uv sync' in ${repoRoot}. Details: ${importCheck.stderr || importCheck.stdout}`
     );
   }
@@ -726,8 +867,34 @@ function startAgentProcess() {
     "--model",
     config.mlxModel,
     "--audio-output-dir",
-    config.agentAudioOutputDir
+    config.agentAudioOutputDir,
+    "--stt-provider",
+    config.agentSttProvider,
+    "--stt-model",
+    config.agentSttModel,
+    "--stt-base-url",
+    resolvedAgentSttBaseUrl(),
+    "--stt-api-key",
+    config.agentSttApiKey
   ];
+  if (config.agentSttLanguage) {
+    args.push("--stt-language", config.agentSttLanguage);
+  }
+  if (config.googleSttProjectId) {
+    args.push("--google-stt-project-id", config.googleSttProjectId);
+  }
+  if (config.googleSttLocation) {
+    args.push("--google-stt-location", config.googleSttLocation);
+  }
+  if (config.googleSttRecognizer) {
+    args.push("--google-stt-recognizer", config.googleSttRecognizer);
+  }
+  if (config.googleSttModel) {
+    args.push("--google-stt-model", config.googleSttModel);
+  }
+  if (config.agentDisableAudioTranscription) {
+    args.push("--disable-audio-transcription");
+  }
   const child = spawn(config.agentRunnerCommand, args, {
     cwd: repoRoot,
     env: process.env,
@@ -888,13 +1055,14 @@ app.post("/agent/chat", asyncHandler(async (req, res) => {
 }));
 
 app.post("/agent/audio-chunk", asyncHandler(async (req, res) => {
+  const callId = String(req.body?.callId || "").trim();
   const audioBase64 = String(req.body?.audioBase64 || "").trim();
   if (!audioBase64) {
     return res.status(400).json({ error: "audioBase64 is required" });
   }
 
   const response = await sendAudioChunkToAgent({
-    callId: String(req.body?.callId || "").trim(),
+    callId,
     streamId: String(req.body?.streamId || "").trim(),
     trackId: String(req.body?.trackId || "").trim(),
     ssrc: Number(req.body?.ssrc || 0),
@@ -906,7 +1074,39 @@ app.post("/agent/audio-chunk", asyncHandler(async (req, res) => {
     audioBase64
   });
 
+  if (callId && (response?.transcriptText || response?.assistantResponse)) {
+    agentAudioState.latestByCallId.set(callId, {
+      updatedAt: new Date().toISOString(),
+      transcriptText: String(response?.transcriptText || ""),
+      assistantResponse: String(response?.assistantResponse || ""),
+      transcriptions: Array.isArray(response?.transcriptions) ? response.transcriptions : []
+    });
+  }
+  if (Array.isArray(response?.transcriptions) && response.transcriptions.length > 0) {
+    console.log(
+      `[bridge] stt call=${callId || "unknown"} results=${JSON.stringify(response.transcriptions)}`
+    );
+  }
+  if (response?.transcriptText) {
+    console.log(`[bridge] transcript call=${callId || "unknown"} text=${JSON.stringify(String(response.transcriptText))}`);
+  }
+  if (response?.assistantResponse) {
+    console.log(`[bridge] assistant call=${callId || "unknown"} text=${JSON.stringify(String(response.assistantResponse))}`);
+  }
+
   return res.json(response ?? { ok: true });
+}));
+
+app.get("/agent/latest-response/:callId", asyncHandler(async (req, res) => {
+  const callId = String(req.params.callId || "").trim();
+  if (!callId) {
+    return res.status(400).json({ error: "callId is required" });
+  }
+  const latest = agentAudioState.latestByCallId.get(callId);
+  if (!latest) {
+    return res.status(404).json({ error: "no response available for call" });
+  }
+  return res.json({ callId, ...latest });
 }));
 
 app.post("/session/start", asyncHandler(async (req, res) => {
@@ -1064,6 +1264,7 @@ async function boot() {
   await initializeFirebaseRuntime(credentials);
   scheduleFirebaseRestart();
   startMlxServer();
+  startMlxAudioServer();
   startAgentProcess();
   app.listen(config.port, () => {
     const bridgeURL = `http://127.0.0.1:${config.port}`;
@@ -1110,6 +1311,7 @@ process.on("SIGINT", () => {
   stopTurnRefreshLoop();
   stopAgentProcess();
   stopMlxServer();
+  stopMlxAudioServer();
   shutdownPeer();
   process.exit(0);
 });
@@ -1119,6 +1321,7 @@ process.on("SIGTERM", () => {
   stopTurnRefreshLoop();
   stopAgentProcess();
   stopMlxServer();
+  stopMlxAudioServer();
   shutdownPeer();
   process.exit(0);
 });
