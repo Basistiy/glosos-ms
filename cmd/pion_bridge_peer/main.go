@@ -90,12 +90,17 @@ type liveAudioForwarder struct {
 	channels        uint16
 	chunkDurationTs uint32
 	seq             int
-	current         *forwardChunk
+	stream          *forwardStream
+	current         *chunkWindow
 }
 
-type forwardChunk struct {
-	filePath       string
-	writer         *oggwriter.OggWriter
+type forwardStream struct {
+	filePath  string
+	writer    *oggwriter.OggWriter
+	bytesSent int64
+}
+
+type chunkWindow struct {
 	startTimestamp uint32
 	hasPackets     bool
 }
@@ -175,13 +180,19 @@ func (g *remoteCandidateGate) markReadyAndFlush(pc *webrtc.PeerConnection) {
 }
 
 func (f *liveAudioForwarder) WriteRTP(packet *rtp.Packet) error {
-	if f.current == nil {
-		if err := f.openChunk(packet.Timestamp); err != nil {
+	if f.stream == nil {
+		if err := f.openStream(); err != nil {
 			return err
 		}
 	}
+	if f.current == nil {
+		f.current = &chunkWindow{
+			startTimestamp: packet.Timestamp,
+			hasPackets:     false,
+		}
+	}
 
-	if err := f.current.writer.WriteRTP(packet); err != nil {
+	if err := f.stream.writer.WriteRTP(packet); err != nil {
 		return err
 	}
 	f.current.hasPackets = true
@@ -194,10 +205,18 @@ func (f *liveAudioForwarder) WriteRTP(packet *rtp.Packet) error {
 }
 
 func (f *liveAudioForwarder) Close() error {
+	if f.stream == nil {
+		return nil
+	}
+
+	if err := f.stream.writer.Close(); err != nil {
+		return err
+	}
+
 	return f.flushChunk(true)
 }
 
-func (f *liveAudioForwarder) openChunk(startTimestamp uint32) error {
+func (f *liveAudioForwarder) openStream() error {
 	file, err := os.CreateTemp(f.outputDir, "agent-audio-*.ogg")
 	if err != nil {
 		return err
@@ -213,55 +232,67 @@ func (f *liveAudioForwarder) openChunk(startTimestamp uint32) error {
 		return err
 	}
 
-	f.current = &forwardChunk{
-		filePath:       filePath,
-		writer:         writer,
-		startTimestamp: startTimestamp,
+	f.stream = &forwardStream{
+		filePath:  filePath,
+		writer:    writer,
+		bytesSent: 0,
 	}
 
 	return nil
 }
 
 func (f *liveAudioForwarder) flushChunk(final bool) error {
-	if f.current == nil {
+	if f.stream == nil {
 		return nil
 	}
 
-	chunk := f.current
-	f.current = nil
-
-	if !chunk.hasPackets {
-		if err := chunk.writer.Close(); err != nil {
-			log.Printf("close empty audio chunk error: %v", err)
-		}
-		_ = os.Remove(chunk.filePath)
+	if f.current == nil && !final {
+		return nil
+	}
+	if f.current != nil && !f.current.hasPackets && !final {
+		f.current = nil
 		return nil
 	}
 
-	if err := chunk.writer.Close(); err != nil {
-		return err
-	}
-
-	audioBytes, err := os.ReadFile(chunk.filePath)
+	audioBytes, err := os.ReadFile(f.stream.filePath)
 	if err != nil {
 		return err
 	}
-	if removeErr := os.Remove(chunk.filePath); removeErr != nil {
-		log.Printf("remove temp audio chunk %s error: %v", chunk.filePath, removeErr)
+	if int64(len(audioBytes)) < f.stream.bytesSent {
+		return fmt.Errorf("audio stream truncated: sent=%d current=%d", f.stream.bytesSent, len(audioBytes))
+	}
+
+	delta := audioBytes[f.stream.bytesSent:]
+	f.stream.bytesSent = int64(len(audioBytes))
+	f.current = nil
+
+	if len(delta) == 0 {
+		if final {
+			if removeErr := os.Remove(f.stream.filePath); removeErr != nil {
+				log.Printf("remove temp audio stream %s error: %v", f.stream.filePath, removeErr)
+			}
+			f.stream = nil
+		}
+		return nil
 	}
 
 	seq := f.seq
 	f.seq++
 
 	if final {
-		return f.postChunk(audioBytes, seq, final)
+		err = f.postChunk(delta, seq, true)
+		if removeErr := os.Remove(f.stream.filePath); removeErr != nil {
+			log.Printf("remove temp audio stream %s error: %v", f.stream.filePath, removeErr)
+		}
+		f.stream = nil
+		return err
 	}
 
-	go func() {
-		if err := f.postChunk(audioBytes, seq, final); err != nil {
-			log.Printf("post audio chunk seq=%d error: %v", seq, err)
+	go func(chunk []byte, chunkSeq int) {
+		if err := f.postChunk(chunk, chunkSeq, false); err != nil {
+			log.Printf("post audio chunk seq=%d error: %v", chunkSeq, err)
 		}
-	}()
+	}(append([]byte(nil), delta...), seq)
 
 	return nil
 }

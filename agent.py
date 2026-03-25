@@ -129,10 +129,7 @@ class SpeechChunkRecorder:
         self.target_rate = target_rate
         self.min_silence_chunks = max(1, min_silence_chunks)
         self.pre_speech_chunks = max(0, pre_speech_chunks)
-        self.sequence = 0
-        self.pending_speech_parts: list[Any] = []
-        self.trailing_silence_chunks = 0
-        self.pre_speech_buffer: deque[Any] = deque(maxlen=self.pre_speech_chunks or None)
+        self.streams: dict[str, StreamState] = {}
         self._runtime: dict[str, Any] | None = None
 
     def _ensure_runtime(self) -> dict[str, Any]:
@@ -162,6 +159,7 @@ class SpeechChunkRecorder:
         call_id: str,
         stream_id: str,
         track_id: str,
+        ssrc: int,
         seq: int,
         final: bool,
         audio_bytes: bytes,
@@ -172,7 +170,16 @@ class SpeechChunkRecorder:
         get_speech_timestamps = runtime["get_speech_timestamps"]
         model = runtime["model"]
 
-        samples = self._decode_chunk(audio_bytes, runtime)
+        stream_key = build_stream_key(call_id, stream_id, track_id, ssrc)
+        state = self.streams.setdefault(stream_key, StreamState(pre_speech_chunks=self.pre_speech_chunks))
+        state.ogg_bytes.extend(audio_bytes)
+
+        decoded = self._decode_chunk(bytes(state.ogg_bytes), runtime)
+        if decoded.size < state.decoded_sample_count:
+            state.decoded_sample_count = 0
+
+        samples = decoded[state.decoded_sample_count:].astype(np.float32, copy=False)
+        state.decoded_sample_count = int(decoded.size)
         speech_timestamps: list[dict[str, int]] = []
 
         if samples.size > 0:
@@ -184,23 +191,24 @@ class SpeechChunkRecorder:
             )
         saved_paths: list[str] = []
         if speech_timestamps:
-            if self.pre_speech_buffer:
-                self.pending_speech_parts.extend(self.pre_speech_buffer)
-                self.pre_speech_buffer.clear()
-            self.pending_speech_parts.append(samples)
-            self.trailing_silence_chunks = 0
-        elif self.pending_speech_parts:
+            if state.pre_speech_buffer:
+                state.pending_speech_parts.extend(state.pre_speech_buffer)
+                state.pre_speech_buffer.clear()
+            state.pending_speech_parts.append(samples)
+            state.trailing_silence_chunks = 0
+        elif state.pending_speech_parts:
             if samples.size > 0:
-                self.pending_speech_parts.append(samples)
-            self.trailing_silence_chunks += 1
+                state.pending_speech_parts.append(samples)
+            state.trailing_silence_chunks += 1
         elif samples.size > 0 and self.pre_speech_chunks > 0:
-            self.pre_speech_buffer.append(samples)
+            state.pre_speech_buffer.append(samples)
 
-        if self.pending_speech_parts and (final or self.trailing_silence_chunks >= self.min_silence_chunks):
-            saved_paths.append(self._flush_pending(call_id, stream_id, track_id, runtime))
+        if state.pending_speech_parts and (final or state.trailing_silence_chunks >= self.min_silence_chunks):
+            saved_paths.append(self._flush_pending(call_id, stream_id, track_id, state, runtime))
 
         if final:
-            self.pre_speech_buffer.clear()
+            state.pre_speech_buffer.clear()
+            self.streams.pop(stream_key, None)
 
         return {
             "ok": True,
@@ -246,25 +254,46 @@ class SpeechChunkRecorder:
             return np.array([], dtype=np.float32)
         return np.concatenate(chunks).astype(np.float32, copy=False)
 
-    def _flush_pending(self, call_id: str, stream_id: str, track_id: str, runtime: dict[str, Any]) -> str:
+    def _flush_pending(
+        self,
+        call_id: str,
+        stream_id: str,
+        track_id: str,
+        state: "StreamState",
+        runtime: dict[str, Any],
+    ) -> str:
         np = runtime["np"]
 
-        samples = np.concatenate(self.pending_speech_parts).astype(np.float32, copy=False)
-        self.pending_speech_parts = []
-        self.trailing_silence_chunks = 0
+        samples = np.concatenate(state.pending_speech_parts).astype(np.float32, copy=False)
+        state.pending_speech_parts = []
+        state.trailing_silence_chunks = 0
 
         safe_call_id = sanitize_path_part(call_id or "call")
         safe_stream_id = sanitize_path_part(stream_id or "stream")
         safe_track_id = sanitize_path_part(track_id or "track")
         file_name = (
             f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_"
-            f"{safe_call_id}_{safe_stream_id}_{safe_track_id}_{self.sequence:04d}.wav"
+            f"{safe_call_id}_{safe_stream_id}_{safe_track_id}_{state.sequence:04d}.wav"
         )
-        self.sequence += 1
+        state.sequence += 1
         file_path = self.output_dir / file_name
         write_pcm16_wave(file_path, samples, self.target_rate, np)
         print(f"[audio] saved speech chunk {file_path}", file=sys.stderr)
         return str(file_path)
+
+
+class StreamState:
+    def __init__(self, pre_speech_chunks: int) -> None:
+        self.ogg_bytes = bytearray()
+        self.decoded_sample_count = 0
+        self.sequence = 0
+        self.pending_speech_parts: list[Any] = []
+        self.trailing_silence_chunks = 0
+        self.pre_speech_buffer: deque[Any] = deque(maxlen=pre_speech_chunks or None)
+
+
+def build_stream_key(call_id: str, stream_id: str, track_id: str, ssrc: int) -> str:
+    return "::".join([call_id.strip(), stream_id.strip(), track_id.strip(), str(ssrc)])
 
 
 def sanitize_path_part(value: str) -> str:
@@ -324,6 +353,7 @@ def run_stdio(args: argparse.Namespace) -> None:
                         call_id=str(payload.get("callId", "")).strip(),
                         stream_id=str(payload.get("streamId", "")).strip(),
                         track_id=str(payload.get("trackId", "")).strip(),
+                        ssrc=int(payload.get("ssrc", 0)),
                         seq=int(payload.get("seq", 0)),
                         final=bool(payload.get("final", False)),
                         audio_bytes=base64.b64decode(audio_base64),
