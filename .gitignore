@@ -70,3 +70,11 @@ node_modules/
 
 # Experiments directory
 experiments/
+
+# Local Go build artifacts
+.gocache/
+pion_bridge_peer
+
+# Local media output
+recordings/
+agent_recordings/

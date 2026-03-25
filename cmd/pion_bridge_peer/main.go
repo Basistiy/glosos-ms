@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -11,20 +12,25 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media/oggwriter"
 )
 
 type cfg struct {
-	bridgeURL string
-	callID    string
-	role      string
-	peerID    string
+	bridgeURL    string
+	callID       string
+	role         string
+	peerID       string
+	audioChunkMs int
 }
 
 type remoteDescriptionResponse struct {
@@ -71,12 +77,72 @@ type remoteCandidateGate struct {
 	seenUfrag map[string]struct{}
 }
 
+type liveAudioForwarder struct {
+	client          *http.Client
+	bridgeURL       string
+	callID          string
+	outputDir       string
+	streamID        string
+	trackID         string
+	ssrc            uint32
+	mimeType        string
+	sampleRate      uint32
+	channels        uint16
+	chunkDurationTs uint32
+	seq             int
+	current         *forwardChunk
+}
+
+type forwardChunk struct {
+	filePath       string
+	writer         *oggwriter.OggWriter
+	startTimestamp uint32
+	hasPackets     bool
+}
+
 func newRemoteCandidateGate() *remoteCandidateGate {
 	return &remoteCandidateGate{
 		ready:     false,
 		queue:     []webrtc.ICECandidateInit{},
 		seenUfrag: map[string]struct{}{},
 	}
+}
+
+func newLiveAudioForwarder(client *http.Client, config cfg, track *webrtc.TrackRemote) (*liveAudioForwarder, error) {
+	codec := track.Codec()
+	sampleRate := uint32(codec.ClockRate)
+	if sampleRate == 0 {
+		sampleRate = 48000
+	}
+
+	channels := uint16(codec.Channels)
+	if channels == 0 {
+		channels = 2
+	}
+
+	chunkDurationTs := uint32((int64(sampleRate) * int64(config.audioChunkMs)) / 1000)
+	if chunkDurationTs == 0 {
+		chunkDurationTs = sampleRate
+	}
+
+	outputDir := filepath.Join(os.TempDir(), "glosos-ms-agent-chunks")
+	if err := os.MkdirAll(outputDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create live audio dir: %w", err)
+	}
+
+	return &liveAudioForwarder{
+		client:          client,
+		bridgeURL:       config.bridgeURL,
+		callID:          config.callID,
+		outputDir:       outputDir,
+		streamID:        track.StreamID(),
+		trackID:         track.ID(),
+		ssrc:            uint32(track.SSRC()),
+		mimeType:        "audio/ogg; codecs=opus",
+		sampleRate:      sampleRate,
+		channels:        channels,
+		chunkDurationTs: chunkDurationTs,
+	}, nil
 }
 
 func (g *remoteCandidateGate) enqueueOrAdd(pc *webrtc.PeerConnection, init webrtc.ICECandidateInit) error {
@@ -106,6 +172,119 @@ func (g *remoteCandidateGate) markReadyAndFlush(pc *webrtc.PeerConnection) {
 	if len(queued) > 0 {
 		log.Printf("flushed %d queued remote candidate(s)", len(queued))
 	}
+}
+
+func (f *liveAudioForwarder) WriteRTP(packet *rtp.Packet) error {
+	if f.current == nil {
+		if err := f.openChunk(packet.Timestamp); err != nil {
+			return err
+		}
+	}
+
+	if err := f.current.writer.WriteRTP(packet); err != nil {
+		return err
+	}
+	f.current.hasPackets = true
+
+	if packet.Timestamp-f.current.startTimestamp >= f.chunkDurationTs {
+		return f.flushChunk(false)
+	}
+
+	return nil
+}
+
+func (f *liveAudioForwarder) Close() error {
+	return f.flushChunk(true)
+}
+
+func (f *liveAudioForwarder) openChunk(startTimestamp uint32) error {
+	file, err := os.CreateTemp(f.outputDir, "agent-audio-*.ogg")
+	if err != nil {
+		return err
+	}
+	filePath := file.Name()
+	if err := file.Close(); err != nil {
+		return err
+	}
+
+	writer, err := oggwriter.New(filePath, f.sampleRate, f.channels)
+	if err != nil {
+		_ = os.Remove(filePath)
+		return err
+	}
+
+	f.current = &forwardChunk{
+		filePath:       filePath,
+		writer:         writer,
+		startTimestamp: startTimestamp,
+	}
+
+	return nil
+}
+
+func (f *liveAudioForwarder) flushChunk(final bool) error {
+	if f.current == nil {
+		return nil
+	}
+
+	chunk := f.current
+	f.current = nil
+
+	if !chunk.hasPackets {
+		if err := chunk.writer.Close(); err != nil {
+			log.Printf("close empty audio chunk error: %v", err)
+		}
+		_ = os.Remove(chunk.filePath)
+		return nil
+	}
+
+	if err := chunk.writer.Close(); err != nil {
+		return err
+	}
+
+	audioBytes, err := os.ReadFile(chunk.filePath)
+	if err != nil {
+		return err
+	}
+	if removeErr := os.Remove(chunk.filePath); removeErr != nil {
+		log.Printf("remove temp audio chunk %s error: %v", chunk.filePath, removeErr)
+	}
+
+	seq := f.seq
+	f.seq++
+
+	if final {
+		return f.postChunk(audioBytes, seq, final)
+	}
+
+	go func() {
+		if err := f.postChunk(audioBytes, seq, final); err != nil {
+			log.Printf("post audio chunk seq=%d error: %v", seq, err)
+		}
+	}()
+
+	return nil
+}
+
+func (f *liveAudioForwarder) postChunk(audioBytes []byte, seq int, final bool) error {
+	payload := map[string]any{
+		"callId":      f.callID,
+		"streamId":    f.streamID,
+		"trackId":     f.trackID,
+		"ssrc":        f.ssrc,
+		"mimeType":    f.mimeType,
+		"sampleRate":  f.sampleRate,
+		"channels":    f.channels,
+		"seq":         seq,
+		"final":       final,
+		"audioBase64": base64.StdEncoding.EncodeToString(audioBytes),
+	}
+	if err := postJSON(f.client, f.bridgeURL+"/agent/audio-chunk", payload, nil); err != nil {
+		return err
+	}
+	log.Printf("posted audio chunk seq=%d bytes=%d final=%v", seq, len(audioBytes), final)
+
+	return nil
 }
 
 func main() {
@@ -177,6 +356,34 @@ func main() {
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
 		log.Printf("incoming data channel: %s", dc.Label())
 		wireDC(agentClient, config, dc)
+	})
+	pc.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		codec := track.Codec()
+		log.Printf(
+			"incoming track kind=%s mime=%s stream=%s track=%s ssrc=%d",
+			track.Kind().String(),
+			codec.MimeType,
+			track.StreamID(),
+			track.ID(),
+			track.SSRC(),
+		)
+
+		if track.Kind() != webrtc.RTPCodecTypeAudio {
+			log.Printf("ignoring non-audio track mime=%s", codec.MimeType)
+			return
+		}
+
+		if !strings.EqualFold(codec.MimeType, webrtc.MimeTypeOpus) {
+			log.Printf("ignoring unsupported audio codec mime=%s", codec.MimeType)
+			return
+		}
+
+		forwarder, err := newLiveAudioForwarder(client, config, track)
+		if err != nil {
+			log.Printf("create live audio forwarder error: %v", err)
+			return
+		}
+		go forwardTrack(forwarder, track)
 	})
 
 	var (
@@ -270,6 +477,28 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("shutting down")
+}
+
+func forwardTrack(forwarder *liveAudioForwarder, track *webrtc.TrackRemote) {
+	defer func() {
+		if err := forwarder.Close(); err != nil {
+			log.Printf("close live forwarder error: %v", err)
+		}
+	}()
+
+	for {
+		rtpPacket, _, err := track.ReadRTP()
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("read track error: %v", err)
+			}
+			return
+		}
+		if err := forwarder.WriteRTP(rtpPacket); err != nil {
+			log.Printf("forward track error: %v", err)
+			return
+		}
+	}
 }
 
 func pollRemoteDescription(
@@ -454,9 +683,11 @@ func getJSON(client *http.Client, url string, out any) error {
 
 func loadCfg() cfg {
 	var role, bridgeURL, peerID string
+	var audioChunkMs int
 	flag.StringVar(&role, "role", "callee", "Role: caller or callee")
 	flag.StringVar(&bridgeURL, "bridge-url", "http://127.0.0.1:8080", "Bridge base URL")
 	flag.StringVar(&peerID, "peer-id", "", "Optional peer identifier for TURN username")
+	flag.IntVar(&audioChunkMs, "audio-chunk-ms", 1000, "Duration of streamed audio chunks in milliseconds")
 	flag.Parse()
 
 	role = strings.TrimSpace(role)
@@ -468,6 +699,9 @@ func loadCfg() cfg {
 	if bridgeURL == "" {
 		log.Fatal("-bridge-url is required")
 	}
+	if audioChunkMs <= 0 {
+		log.Fatal("-audio-chunk-ms must be greater than zero")
+	}
 
 	if override := strings.TrimSpace(os.Getenv("BRIDGE_URL")); override != "" {
 		bridgeURL = strings.TrimRight(override, "/")
@@ -478,6 +712,13 @@ func loadCfg() cfg {
 	if overridePeerID := strings.TrimSpace(os.Getenv("PEER_ID")); overridePeerID != "" {
 		peerID = overridePeerID
 	}
+	if overrideAudioChunkMs := strings.TrimSpace(os.Getenv("PION_AGENT_AUDIO_CHUNK_MS")); overrideAudioChunkMs != "" {
+		parsed, err := strconv.Atoi(overrideAudioChunkMs)
+		if err != nil || parsed <= 0 {
+			log.Fatalf("invalid PION_AGENT_AUDIO_CHUNK_MS: %q", overrideAudioChunkMs)
+		}
+		audioChunkMs = parsed
+	}
 	if peerID == "" {
 		peerID = fmt.Sprintf("%s-%d", role, time.Now().Unix())
 	}
@@ -486,9 +727,10 @@ func loadCfg() cfg {
 	log.Printf("generated call id: %s", callID)
 
 	return cfg{
-		bridgeURL: bridgeURL,
-		callID:    callID,
-		role:      role,
-		peerID:    peerID,
+		bridgeURL:    bridgeURL,
+		callID:       callID,
+		role:         role,
+		peerID:       peerID,
+		audioChunkMs: audioChunkMs,
 	}
 }

@@ -80,8 +80,9 @@ const config = {
   pionPeerRestartDelayMs: intEnv("PION_PEER_RESTART_DELAY_MS", 3000),
   autoStartAgent: (process.env.AUTO_START_AGENT || "1").trim() !== "0",
   agentRunnerCommand: (process.env.AGENT_RUNNER_COMMAND || "uv").trim(),
+  agentAudioOutputDir: (process.env.AGENT_AUDIO_OUTPUT_DIR || "agent_recordings").trim(),
   agentRestartDelayMs: intEnv("AGENT_RESTART_DELAY_MS", 3000),
-  agentRequiredImports: (process.env.AGENT_REQUIRED_IMPORTS || "smolagents,mlx_lm").split(",")
+  agentRequiredImports: (process.env.AGENT_REQUIRED_IMPORTS || "smolagents,mlx_lm,av,torch,silero_vad").split(",")
     .map((item) => item.trim())
     .filter(Boolean)
 };
@@ -705,7 +706,7 @@ function handleAgentStdout(chunk) {
       pending.reject(new Error(payload.error));
       continue;
     }
-    pending.resolve(String(payload.response ?? ""));
+    pending.resolve(payload);
   }
 }
 
@@ -716,7 +717,17 @@ function startAgentProcess() {
 
   ensureAgentRuntimeReady();
 
-  const args = ["run", "agent.py", "--stdio", "--api-base", mlxApiBase(), "--model", config.mlxModel];
+  const args = [
+    "run",
+    "agent.py",
+    "--stdio",
+    "--api-base",
+    mlxApiBase(),
+    "--model",
+    config.mlxModel,
+    "--audio-output-dir",
+    config.agentAudioOutputDir
+  ];
   const child = spawn(config.agentRunnerCommand, args, {
     cwd: repoRoot,
     env: process.env,
@@ -754,12 +765,33 @@ async function chatWithAgent(message, { reset = false } = {}) {
   if (!message.trim()) {
     throw new Error("message is required");
   }
+  const response = await sendAgentRequest({ type: "chat", message, reset });
+  return String(response?.response ?? "");
+}
+
+async function sendAudioChunkToAgent(chunk) {
+  return sendAgentRequest({
+    type: "audio_chunk",
+    callId: chunk.callId,
+    streamId: chunk.streamId,
+    trackId: chunk.trackId,
+    ssrc: chunk.ssrc,
+    mimeType: chunk.mimeType,
+    sampleRate: chunk.sampleRate,
+    channels: chunk.channels,
+    seq: chunk.seq,
+    final: Boolean(chunk.final),
+    audioBase64: chunk.audioBase64
+  });
+}
+
+async function sendAgentRequest(request) {
   if (!agentState.process || !agentState.process.stdin || agentState.process.killed) {
     throw new Error("agent process is not running");
   }
 
   const id = `req-${agentState.nextRequestID++}`;
-  const payload = JSON.stringify({ id, message, reset });
+  const payload = JSON.stringify({ id, ...request });
 
   return new Promise((resolve, reject) => {
     agentState.pending.set(id, { resolve, reject });
@@ -853,6 +885,28 @@ app.post("/agent/chat", asyncHandler(async (req, res) => {
   const reset = Boolean(req.body?.reset);
   const response = await chatWithAgent(message, { reset });
   return res.json({ response });
+}));
+
+app.post("/agent/audio-chunk", asyncHandler(async (req, res) => {
+  const audioBase64 = String(req.body?.audioBase64 || "").trim();
+  if (!audioBase64) {
+    return res.status(400).json({ error: "audioBase64 is required" });
+  }
+
+  const response = await sendAudioChunkToAgent({
+    callId: String(req.body?.callId || "").trim(),
+    streamId: String(req.body?.streamId || "").trim(),
+    trackId: String(req.body?.trackId || "").trim(),
+    ssrc: Number(req.body?.ssrc || 0),
+    mimeType: String(req.body?.mimeType || "audio/ogg; codecs=opus").trim(),
+    sampleRate: Number(req.body?.sampleRate || 48000),
+    channels: Number(req.body?.channels || 2),
+    seq: Number(req.body?.seq || 0),
+    final: Boolean(req.body?.final),
+    audioBase64
+  });
+
+  return res.json(response ?? { ok: true });
 }));
 
 app.post("/session/start", asyncHandler(async (req, res) => {
