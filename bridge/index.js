@@ -85,7 +85,6 @@ const config = {
   pionPeerRestartDelayMs: intEnv("PION_PEER_RESTART_DELAY_MS", 3000),
   autoStartAgent: (process.env.AUTO_START_AGENT || "1").trim() !== "0",
   agentRunnerCommand: (process.env.AGENT_RUNNER_COMMAND || "uv").trim(),
-  agentAudioOutputDir: (process.env.AGENT_AUDIO_OUTPUT_DIR || "agent_recordings").trim(),
   agentSttProvider: (process.env.AGENT_STT_PROVIDER || "mlx_audio").trim(),
   agentSttBaseUrl: (process.env.AGENT_STT_BASE_URL || "").trim(),
   agentSttApiKey: (process.env.AGENT_STT_API_KEY || "mlx-audio").trim(),
@@ -97,7 +96,7 @@ const config = {
   googleSttModel: (process.env.GOOGLE_STT_MODEL || "").trim(),
   agentDisableAudioTranscription: (process.env.AGENT_DISABLE_AUDIO_TRANSCRIPTION || "0").trim() === "1",
   agentRestartDelayMs: intEnv("AGENT_RESTART_DELAY_MS", 3000),
-  agentRequiredImports: (process.env.AGENT_REQUIRED_IMPORTS || "smolagents,mlx_lm,av,torch,silero_vad").split(",")
+  agentRequiredImports: (process.env.AGENT_REQUIRED_IMPORTS || "openai").split(",")
     .map((item) => item.trim())
     .filter(Boolean)
 };
@@ -133,10 +132,6 @@ const agentState = {
   lineBuffer: "",
   nextRequestID: 1,
   pending: new Map()
-};
-
-const agentAudioState = {
-  latestByCallId: new Map()
 };
 
 const firebaseState = {
@@ -311,10 +306,6 @@ function prefixStream(stream, prefix) {
       buffer = "";
     }
   });
-}
-
-function resolvedAgentSttBaseUrl() {
-  return config.agentSttBaseUrl || mlxAudioApiBase();
 }
 
 function clearPeerRestartTimer() {
@@ -562,6 +553,8 @@ function startPionPeer(bridgeURL) {
 
   const args = [
     "run",
+    "-tags",
+    "nolibopusfile",
     "./cmd/pion_bridge_peer",
     "-role",
     config.pionPeerRole,
@@ -623,12 +616,6 @@ function ensureAgentRuntimeReady() {
   }
 
   const requiredImports = [...config.agentRequiredImports];
-  if (!config.agentDisableAudioTranscription) {
-    if (config.agentSttProvider === "google") {
-      requiredImports.push("google.cloud.speech_v2");
-    }
-  }
-
   if (requiredImports.length === 0) {
     return;
   }
@@ -865,36 +852,8 @@ function startAgentProcess() {
     "--api-base",
     mlxApiBase(),
     "--model",
-    config.mlxModel,
-    "--audio-output-dir",
-    config.agentAudioOutputDir,
-    "--stt-provider",
-    config.agentSttProvider,
-    "--stt-model",
-    config.agentSttModel,
-    "--stt-base-url",
-    resolvedAgentSttBaseUrl(),
-    "--stt-api-key",
-    config.agentSttApiKey
+    config.mlxModel
   ];
-  if (config.agentSttLanguage) {
-    args.push("--stt-language", config.agentSttLanguage);
-  }
-  if (config.googleSttProjectId) {
-    args.push("--google-stt-project-id", config.googleSttProjectId);
-  }
-  if (config.googleSttLocation) {
-    args.push("--google-stt-location", config.googleSttLocation);
-  }
-  if (config.googleSttRecognizer) {
-    args.push("--google-stt-recognizer", config.googleSttRecognizer);
-  }
-  if (config.googleSttModel) {
-    args.push("--google-stt-model", config.googleSttModel);
-  }
-  if (config.agentDisableAudioTranscription) {
-    args.push("--disable-audio-transcription");
-  }
   const child = spawn(config.agentRunnerCommand, args, {
     cwd: repoRoot,
     env: process.env,
@@ -934,22 +893,6 @@ async function chatWithAgent(message, { reset = false } = {}) {
   }
   const response = await sendAgentRequest({ type: "chat", message, reset });
   return String(response?.response ?? "");
-}
-
-async function sendAudioChunkToAgent(chunk) {
-  return sendAgentRequest({
-    type: "audio_chunk",
-    callId: chunk.callId,
-    streamId: chunk.streamId,
-    trackId: chunk.trackId,
-    ssrc: chunk.ssrc,
-    mimeType: chunk.mimeType,
-    sampleRate: chunk.sampleRate,
-    channels: chunk.channels,
-    seq: chunk.seq,
-    final: Boolean(chunk.final),
-    audioBase64: chunk.audioBase64
-  });
 }
 
 async function sendAgentRequest(request) {
@@ -1052,61 +995,6 @@ app.post("/agent/chat", asyncHandler(async (req, res) => {
   const reset = Boolean(req.body?.reset);
   const response = await chatWithAgent(message, { reset });
   return res.json({ response });
-}));
-
-app.post("/agent/audio-chunk", asyncHandler(async (req, res) => {
-  const callId = String(req.body?.callId || "").trim();
-  const audioBase64 = String(req.body?.audioBase64 || "").trim();
-  if (!audioBase64) {
-    return res.status(400).json({ error: "audioBase64 is required" });
-  }
-
-  const response = await sendAudioChunkToAgent({
-    callId,
-    streamId: String(req.body?.streamId || "").trim(),
-    trackId: String(req.body?.trackId || "").trim(),
-    ssrc: Number(req.body?.ssrc || 0),
-    mimeType: String(req.body?.mimeType || "audio/ogg; codecs=opus").trim(),
-    sampleRate: Number(req.body?.sampleRate || 48000),
-    channels: Number(req.body?.channels || 2),
-    seq: Number(req.body?.seq || 0),
-    final: Boolean(req.body?.final),
-    audioBase64
-  });
-
-  if (callId && (response?.transcriptText || response?.assistantResponse)) {
-    agentAudioState.latestByCallId.set(callId, {
-      updatedAt: new Date().toISOString(),
-      transcriptText: String(response?.transcriptText || ""),
-      assistantResponse: String(response?.assistantResponse || ""),
-      transcriptions: Array.isArray(response?.transcriptions) ? response.transcriptions : []
-    });
-  }
-  if (Array.isArray(response?.transcriptions) && response.transcriptions.length > 0) {
-    console.log(
-      `[bridge] stt call=${callId || "unknown"} results=${JSON.stringify(response.transcriptions)}`
-    );
-  }
-  if (response?.transcriptText) {
-    console.log(`[bridge] transcript call=${callId || "unknown"} text=${JSON.stringify(String(response.transcriptText))}`);
-  }
-  if (response?.assistantResponse) {
-    console.log(`[bridge] assistant call=${callId || "unknown"} text=${JSON.stringify(String(response.assistantResponse))}`);
-  }
-
-  return res.json(response ?? { ok: true });
-}));
-
-app.get("/agent/latest-response/:callId", asyncHandler(async (req, res) => {
-  const callId = String(req.params.callId || "").trim();
-  if (!callId) {
-    return res.status(400).json({ error: "callId is required" });
-  }
-  const latest = agentAudioState.latestByCallId.get(callId);
-  if (!latest) {
-    return res.status(404).json({ error: "no response available for call" });
-  }
-  return res.json({ callId, ...latest });
 }));
 
 app.post("/session/start", asyncHandler(async (req, res) => {

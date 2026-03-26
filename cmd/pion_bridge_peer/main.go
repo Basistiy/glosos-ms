@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"math"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,17 +22,36 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/pion/rtp"
+	ort "github.com/yalue/onnxruntime_go"
+	"gopkg.in/hraban/opus.v2"
+
 	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media/oggwriter"
+	"glosos-ms/internal/silerovad"
+)
+
+const (
+	defaultSttBaseURL         = "http://127.0.0.1:8001/v1"
+	defaultSttModel           = "mlx-community/whisper-large-v3-turbo-asr-fp16"
+	defaultSttAPIKey          = "mlx-audio"
+	targetVADSampleRate       = 16000
+	maxOpusFrameMillis        = 60
 )
 
 type cfg struct {
-	bridgeURL    string
-	callID       string
-	role         string
-	peerID       string
-	audioChunkMs int
+	bridgeURL          string
+	callID             string
+	role               string
+	peerID             string
+	sttBaseURL         string
+	sttModel           string
+	sttAPIKey          string
+	sttLanguage        string
+	onnxRuntimeLibPath string
+	sileroModelPath    string
+	vadSpeechThreshold float64
+	vadNoiseThreshold  float64
+	vadMinSilenceMs    int
+	vadSpeechPadMs     int
 }
 
 type remoteDescriptionResponse struct {
@@ -63,9 +84,8 @@ type agentChatResponse struct {
 	Response string `json:"response"`
 }
 
-type agentAudioChunkResponse struct {
-	Response          string `json:"response"`
-	AssistantResponse string `json:"assistantResponse"`
+type transcriptionResponse struct {
+	Text string `json:"text"`
 }
 
 type pendingCandidate struct {
@@ -82,33 +102,22 @@ type remoteCandidateGate struct {
 	seenUfrag map[string]struct{}
 }
 
-type liveAudioForwarder struct {
-	client          *http.Client
-	getDC           func() *webrtc.DataChannel
-	bridgeURL       string
-	callID          string
-	outputDir       string
-	streamID        string
-	trackID         string
-	ssrc            uint32
-	mimeType        string
-	sampleRate      uint32
-	channels        uint16
-	chunkDurationTs uint32
-	seq             int
-	stream          *forwardStream
-	current         *chunkWindow
-}
-
-type forwardStream struct {
-	filePath  string
-	writer    *oggwriter.OggWriter
-	bytesSent int64
-}
-
-type chunkWindow struct {
-	startTimestamp uint32
-	hasPackets     bool
+type speechPipeline struct {
+	sttClient    *http.Client
+	agentClient  *http.Client
+	config       cfg
+	getDC        func() *webrtc.DataChannel
+	bridgeURL    string
+	callID       string
+	decoder      *opus.Decoder
+	detector     *silerovad.Detector
+	sourceRate   int
+	sourceChans  int
+	bufferMu     sync.Mutex
+	bufferedPCM  []float32
+	bufferOffset int
+	segmentStart int
+	processMu    sync.Mutex
 }
 
 func newRemoteCandidateGate() *remoteCandidateGate {
@@ -117,44 +126,6 @@ func newRemoteCandidateGate() *remoteCandidateGate {
 		queue:     []webrtc.ICECandidateInit{},
 		seenUfrag: map[string]struct{}{},
 	}
-}
-
-func newLiveAudioForwarder(client *http.Client, getDC func() *webrtc.DataChannel, config cfg, track *webrtc.TrackRemote) (*liveAudioForwarder, error) {
-	codec := track.Codec()
-	sampleRate := uint32(codec.ClockRate)
-	if sampleRate == 0 {
-		sampleRate = 48000
-	}
-
-	channels := uint16(codec.Channels)
-	if channels == 0 {
-		channels = 2
-	}
-
-	chunkDurationTs := uint32((int64(sampleRate) * int64(config.audioChunkMs)) / 1000)
-	if chunkDurationTs == 0 {
-		chunkDurationTs = sampleRate
-	}
-
-	outputDir := filepath.Join(os.TempDir(), "glosos-ms-agent-chunks")
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create live audio dir: %w", err)
-	}
-
-	return &liveAudioForwarder{
-		client:          client,
-		getDC:           getDC,
-		bridgeURL:       config.bridgeURL,
-		callID:          config.callID,
-		outputDir:       outputDir,
-		streamID:        track.StreamID(),
-		trackID:         track.ID(),
-		ssrc:            uint32(track.SSRC()),
-		mimeType:        "audio/ogg; codecs=opus",
-		sampleRate:      sampleRate,
-		channels:        channels,
-		chunkDurationTs: chunkDurationTs,
-	}, nil
 }
 
 func (g *remoteCandidateGate) enqueueOrAdd(pc *webrtc.PeerConnection, init webrtc.ICECandidateInit) error {
@@ -186,167 +157,238 @@ func (g *remoteCandidateGate) markReadyAndFlush(pc *webrtc.PeerConnection) {
 	}
 }
 
-func (f *liveAudioForwarder) WriteRTP(packet *rtp.Packet) error {
-	if f.stream == nil {
-		if err := f.openStream(); err != nil {
-			return err
-		}
-	}
-	if f.current == nil {
-		f.current = &chunkWindow{
-			startTimestamp: packet.Timestamp,
-			hasPackets:     false,
-		}
+func newSpeechPipeline(
+	sttClient *http.Client,
+	agentClient *http.Client,
+	getDC func() *webrtc.DataChannel,
+	config cfg,
+	track *webrtc.TrackRemote,
+) (*speechPipeline, error) {
+	codec := track.Codec()
+	sampleRate := int(codec.ClockRate)
+	if sampleRate == 0 {
+		sampleRate = 48000
 	}
 
-	if err := f.stream.writer.WriteRTP(packet); err != nil {
+	channels := int(codec.Channels)
+	if channels == 0 {
+		channels = 2
+	}
+
+	decoder, err := opus.NewDecoder(sampleRate, channels)
+	if err != nil {
+		return nil, fmt.Errorf("create opus decoder: %w", err)
+	}
+
+	model, err := silerovad.NewModel(targetVADSampleRate, config.sileroModelPath)
+	if err != nil {
+		return nil, fmt.Errorf("create silero model: %w", err)
+	}
+
+	pipeline := &speechPipeline{
+		sttClient:    sttClient,
+		agentClient:  agentClient,
+		config:       config,
+		getDC:        getDC,
+		bridgeURL:    config.bridgeURL,
+		callID:       config.callID,
+		decoder:      decoder,
+		sourceRate:   sampleRate,
+		sourceChans:  channels,
+		segmentStart: -1,
+	}
+
+	detector, err := silerovad.NewDetector(
+		model,
+		silerovad.Config{
+			SpeechThreshold: float32(config.vadSpeechThreshold),
+			NoiseThreshold:  float32(config.vadNoiseThreshold),
+			MinSilence:      time.Duration(config.vadMinSilenceMs) * time.Millisecond,
+			SpeechPad:       time.Duration(config.vadSpeechPadMs) * time.Millisecond,
+		},
+		pipeline.onSpeechSegment,
+	)
+	if err != nil {
+		model.Destroy()
+		return nil, fmt.Errorf("create silero detector: %w", err)
+	}
+	pipeline.detector = detector
+	return pipeline, nil
+}
+
+func (p *speechPipeline) Close() error {
+	if p.detector == nil {
+		return nil
+	}
+	if err := p.detector.Detect(nil); err != nil && !strings.Contains(err.Error(), "no data to process") {
 		return err
 	}
-	f.current.hasPackets = true
-
-	if packet.Timestamp-f.current.startTimestamp >= f.chunkDurationTs {
-		return f.flushChunk(false)
-	}
-
+	p.detector.Destroy()
+	p.detector = nil
 	return nil
 }
 
-func (f *liveAudioForwarder) Close() error {
-	if f.stream == nil {
+func (p *speechPipeline) WritePayload(payload []byte) error {
+	if len(payload) == 0 {
 		return nil
 	}
 
-	if err := f.stream.writer.Close(); err != nil {
-		return err
-	}
-
-	return f.flushChunk(true)
-}
-
-func (f *liveAudioForwarder) openStream() error {
-	file, err := os.CreateTemp(f.outputDir, "agent-audio-*.ogg")
+	decodeStartedAt := time.Now()
+	maxFrameSamples := p.sourceRate * maxOpusFrameMillis / 1000
+	pcm := make([]float32, maxFrameSamples*p.sourceChans)
+	samplesPerChannel, err := p.decoder.DecodeFloat32(payload, pcm)
 	if err != nil {
-		return err
-	}
-	filePath := file.Name()
-	if err := file.Close(); err != nil {
-		return err
+		return fmt.Errorf("decode opus payload: %w", err)
 	}
 
-	writer, err := oggwriter.New(filePath, f.sampleRate, f.channels)
-	if err != nil {
-		_ = os.Remove(filePath)
-		return err
+	decoded := pcm[:samplesPerChannel*p.sourceChans]
+	mono := resampleToMono(decoded, p.sourceRate, p.sourceChans, targetVADSampleRate)
+	if len(mono) == 0 {
+		return nil
 	}
 
-	f.stream = &forwardStream{
-		filePath:  filePath,
-		writer:    writer,
-		bytesSent: 0,
+	p.bufferMu.Lock()
+	p.bufferedPCM = append(p.bufferedPCM, mono...)
+	p.bufferMu.Unlock()
+
+	if err := p.detector.Detect(mono); err != nil && !strings.Contains(err.Error(), "no data to process") {
+		return fmt.Errorf("run silero detect: %w", err)
 	}
 
+	_ = decodeStartedAt
 	return nil
 }
 
-func (f *liveAudioForwarder) flushChunk(final bool) error {
-	if f.stream == nil {
-		return nil
+func (p *speechPipeline) onSpeechSegment(start, end silerovad.SampleOffset) {
+	p.bufferMu.Lock()
+	defer p.bufferMu.Unlock()
+
+	if start != silerovad.InvalidSampleOffset {
+		p.segmentStart = int(start)
 	}
 
-	if f.current == nil && !final {
-		return nil
-	}
-	if f.current != nil && !f.current.hasPackets && !final {
-		f.current = nil
-		return nil
+	if end == silerovad.InvalidSampleOffset || p.segmentStart < 0 {
+		return
 	}
 
-	audioBytes, err := os.ReadFile(f.stream.filePath)
+	startAbs := maxInt(p.segmentStart, p.bufferOffset)
+	endAbs := int(end)
+	if endAbs <= startAbs {
+		p.segmentStart = -1
+		return
+	}
+
+	bufferEnd := p.bufferOffset + len(p.bufferedPCM)
+	if endAbs > bufferEnd {
+		endAbs = bufferEnd
+	}
+	if startAbs >= endAbs {
+		p.segmentStart = -1
+		return
+	}
+
+	startIndex := startAbs - p.bufferOffset
+	endIndex := endAbs - p.bufferOffset
+	segment := append([]float32(nil), p.bufferedPCM[startIndex:endIndex]...)
+	p.bufferedPCM = append([]float32(nil), p.bufferedPCM[endIndex:]...)
+	p.bufferOffset = endAbs
+	p.segmentStart = -1
+
+	go p.processSegment(segment)
+}
+
+func (p *speechPipeline) processSegment(samples []float32) {
+	p.processMu.Lock()
+	defer p.processMu.Unlock()
+
+	turnStartedAt := time.Now()
+	wavBytes, err := encodePCM16WAV(samples, targetVADSampleRate)
 	if err != nil {
-		return err
-	}
-	if int64(len(audioBytes)) < f.stream.bytesSent {
-		return fmt.Errorf("audio stream truncated: sent=%d current=%d", f.stream.bytesSent, len(audioBytes))
+		log.Printf("encode speech segment wav error: %v", err)
+		return
 	}
 
-	delta := audioBytes[f.stream.bytesSent:]
-	f.stream.bytesSent = int64(len(audioBytes))
-	f.current = nil
+	sttStartedAt := time.Now()
+	transcript, err := transcribeSpeechSegment(p.sttClient, p.config, wavBytes)
+	if err != nil {
+		log.Printf("transcribe speech segment error: %v", err)
+		return
+	}
+	log.Printf("[timing] stage=go_audio_stt chars=%d stt_ms=%d", len(transcript), time.Since(sttStartedAt).Milliseconds())
+	if strings.TrimSpace(transcript) == "" {
+		return
+	}
+	log.Printf("[stt] transcript=%q", transcript)
 
-	if len(delta) == 0 {
-		if final {
-			if removeErr := os.Remove(f.stream.filePath); removeErr != nil {
-				log.Printf("remove temp audio stream %s error: %v", f.stream.filePath, removeErr)
+	chatStartedAt := time.Now()
+	reply, err := runAgentChat(p.agentClient, p.bridgeURL, buildAudioUserText(transcript))
+	if err != nil {
+		log.Printf("agent request error: %v", err)
+		return
+	}
+	log.Printf("[timing] stage=go_audio_llm transcript_chars=%d llm_ms=%d", len(transcript), time.Since(chatStartedAt).Milliseconds())
+
+	if strings.TrimSpace(reply) == "" {
+		return
+	}
+	dc := p.getDC()
+	if dc == nil {
+		log.Printf("agent send skipped: data channel not ready")
+		return
+	}
+	if err := dc.SendText(reply); err != nil {
+		log.Printf("agent send error: %v", err)
+		return
+	}
+	log.Printf("sent agent response")
+	log.Printf("[timing] stage=go_audio_turn total_ms=%d", time.Since(turnStartedAt).Milliseconds())
+}
+
+func forwardTrack(pipeline *speechPipeline, track *webrtc.TrackRemote) {
+	defer func() {
+		if err := pipeline.Close(); err != nil {
+			log.Printf("close speech pipeline error: %v", err)
+		}
+	}()
+
+	for {
+		rtpPacket, _, err := track.ReadRTP()
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("read track error: %v", err)
 			}
-			f.stream = nil
+			return
 		}
-		return nil
-	}
-
-	seq := f.seq
-	f.seq++
-
-	if final {
-		err = f.postChunk(delta, seq, true)
-		if removeErr := os.Remove(f.stream.filePath); removeErr != nil {
-			log.Printf("remove temp audio stream %s error: %v", f.stream.filePath, removeErr)
-		}
-		f.stream = nil
-		return err
-	}
-
-	go func(chunk []byte, chunkSeq int) {
-		if err := f.postChunk(chunk, chunkSeq, false); err != nil {
-			log.Printf("post audio chunk seq=%d error: %v", chunkSeq, err)
-		}
-	}(append([]byte(nil), delta...), seq)
-
-	return nil
-}
-
-func (f *liveAudioForwarder) postChunk(audioBytes []byte, seq int, final bool) error {
-	payload := map[string]any{
-		"callId":      f.callID,
-		"streamId":    f.streamID,
-		"trackId":     f.trackID,
-		"ssrc":        f.ssrc,
-		"mimeType":    f.mimeType,
-		"sampleRate":  f.sampleRate,
-		"channels":    f.channels,
-		"seq":         seq,
-		"final":       final,
-		"audioBase64": base64.StdEncoding.EncodeToString(audioBytes),
-	}
-	resp := agentAudioChunkResponse{}
-	if err := postJSON(f.client, f.bridgeURL+"/agent/audio-chunk", payload, &resp); err != nil {
-		return err
-	}
-	log.Printf("posted audio chunk seq=%d bytes=%d final=%v", seq, len(audioBytes), final)
-	reply := strings.TrimSpace(resp.AssistantResponse)
-	if reply == "" {
-		reply = strings.TrimSpace(resp.Response)
-	}
-	if reply != "" && reply != "audio chunk processed" {
-		dc := f.getDC()
-		if dc == nil {
-			log.Printf("agent send skipped: data channel not ready")
-		} else if sendErr := dc.SendText(reply); sendErr != nil {
-			log.Printf("agent send error: %v", sendErr)
-		} else {
-			log.Printf("sent agent response")
+		if err := pipeline.WritePayload(rtpPacket.Payload); err != nil {
+			if strings.Contains(err.Error(), "no data supplied") {
+				log.Printf("ignoring empty opus payload")
+				continue
+			}
+			log.Printf("process audio payload error: %v", err)
+			return
 		}
 	}
-
-	return nil
 }
 
 func main() {
 	config := loadCfg()
+	ort.SetSharedLibraryPath(config.onnxRuntimeLibPath)
+	if err := ort.InitializeEnvironment(); err != nil {
+		log.Fatalf("initialize onnx runtime: %v", err)
+	}
+	defer func() {
+		if err := ort.DestroyEnvironment(); err != nil {
+			log.Printf("destroy onnx runtime error: %v", err)
+		}
+	}()
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	client := &http.Client{Timeout: 20 * time.Second}
+	sttClient := &http.Client{Timeout: 2 * time.Minute}
 	agentClient := &http.Client{Timeout: 2 * time.Minute}
+
 	var currentDC struct {
 		sync.RWMutex
 		value *webrtc.DataChannel
@@ -446,12 +488,12 @@ func main() {
 			return
 		}
 
-		forwarder, err := newLiveAudioForwarder(client, getCurrentDC, config, track)
+		pipeline, err := newSpeechPipeline(sttClient, agentClient, getCurrentDC, config, track)
 		if err != nil {
-			log.Printf("create live audio forwarder error: %v", err)
+			log.Printf("create speech pipeline error: %v", err)
 			return
 		}
-		go forwardTrack(forwarder, track)
+		go forwardTrack(pipeline, track)
 	})
 
 	var (
@@ -546,28 +588,6 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("shutting down")
-}
-
-func forwardTrack(forwarder *liveAudioForwarder, track *webrtc.TrackRemote) {
-	defer func() {
-		if err := forwarder.Close(); err != nil {
-			log.Printf("close live forwarder error: %v", err)
-		}
-	}()
-
-	for {
-		rtpPacket, _, err := track.ReadRTP()
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("read track error: %v", err)
-			}
-			return
-		}
-		if err := forwarder.WriteRTP(rtpPacket); err != nil {
-			log.Printf("forward track error: %v", err)
-			return
-		}
-	}
 }
 
 func pollRemoteDescription(
@@ -685,27 +705,86 @@ func wireDC(client *http.Client, config cfg, dc *webrtc.DataChannel) {
 		log.Printf("recv: %s", userText)
 
 		go func() {
-			resp := agentChatResponse{}
-			err := postJSON(client, config.bridgeURL+"/agent/chat", map[string]any{
-				"message": userText,
-			}, &resp)
+			startedAt := time.Now()
+			reply, err := runAgentChat(client, config.bridgeURL, userText)
 			if err != nil {
 				log.Printf("agent request error: %v", err)
 				return
 			}
-			if resp.Response == "" {
+			if strings.TrimSpace(reply) == "" {
 				return
 			}
-			if sendErr := dc.SendText(resp.Response); sendErr != nil {
+			if sendErr := dc.SendText(reply); sendErr != nil {
 				log.Printf("agent send error: %v", sendErr)
 				return
 			}
 			log.Printf("sent agent response")
+			log.Printf("[timing] stage=go_text_turn total_ms=%d", time.Since(startedAt).Milliseconds())
 		}()
 	})
 	dc.OnClose(func() {
 		log.Printf("data channel closed")
 	})
+}
+
+func runAgentChat(client *http.Client, bridgeURL string, message string) (string, error) {
+	resp := agentChatResponse{}
+	if err := postJSON(client, bridgeURL+"/agent/chat", map[string]any{
+		"message": message,
+	}, &resp); err != nil {
+		return "", err
+	}
+	return resp.Response, nil
+}
+
+func transcribeSpeechSegment(client *http.Client, cfg cfg, wavBytes []byte) (string, error) {
+	body := &bytes.Buffer{}
+	writer := multipart.NewWriter(body)
+
+	filePart, err := writer.CreateFormFile("file", "speech.wav")
+	if err != nil {
+		return "", err
+	}
+	if _, err = filePart.Write(wavBytes); err != nil {
+		return "", err
+	}
+	if err = writer.WriteField("model", cfg.sttModel); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(cfg.sttLanguage) != "" {
+		if err = writer.WriteField("language", cfg.sttLanguage); err != nil {
+			return "", err
+		}
+	}
+	if err = writer.Close(); err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, normalizeOpenAIBaseURL(cfg.sttBaseURL)+"/audio/transcriptions", body)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	if strings.TrimSpace(cfg.sttAPIKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.sttAPIKey)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(raw)))
+	}
+
+	var transcription transcriptionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&transcription); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(transcription.Text), nil
 }
 
 func postJSON(client *http.Client, url string, payload any, out any) error {
@@ -750,27 +829,132 @@ func getJSON(client *http.Client, url string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+func encodePCM16WAV(samples []float32, sampleRate int) ([]byte, error) {
+	dataSize := len(samples) * 2
+	buf := &bytes.Buffer{}
+	writeString := func(value string) error {
+		_, err := buf.WriteString(value)
+		return err
+	}
+
+	if err := writeString("RIFF"); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, uint32(36+dataSize)); err != nil {
+		return nil, err
+	}
+	if err := writeString("WAVE"); err != nil {
+		return nil, err
+	}
+	if err := writeString("fmt "); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, uint32(16)); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, uint16(1)); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, uint16(1)); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, uint32(sampleRate)); err != nil {
+		return nil, err
+	}
+	byteRate := uint32(sampleRate * 2)
+	if err := binary.Write(buf, binary.LittleEndian, byteRate); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, uint16(2)); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, uint16(16)); err != nil {
+		return nil, err
+	}
+	if err := writeString("data"); err != nil {
+		return nil, err
+	}
+	if err := binary.Write(buf, binary.LittleEndian, uint32(dataSize)); err != nil {
+		return nil, err
+	}
+
+	for _, sample := range samples {
+		clamped := maxFloat(-1, minFloat(1, sample))
+		pcm := int16(math.Round(float64(clamped * 32767)))
+		if err := binary.Write(buf, binary.LittleEndian, pcm); err != nil {
+			return nil, err
+		}
+	}
+	return buf.Bytes(), nil
+}
+
+func resampleToMono(samples []float32, inputRate int, channels int, targetRate int) []float32 {
+	if channels <= 0 || len(samples) == 0 {
+		return nil
+	}
+	frames := len(samples) / channels
+	if frames == 0 {
+		return nil
+	}
+
+	mono := make([]float32, frames)
+	if channels == 1 {
+		copy(mono, samples[:frames])
+	} else {
+		for i := 0; i < frames; i++ {
+			var sum float32
+			for ch := 0; ch < channels; ch++ {
+				sum += samples[i*channels+ch]
+			}
+			mono[i] = sum / float32(channels)
+		}
+	}
+
+	if inputRate == targetRate {
+		return mono
+	}
+
+	outputLen := int(math.Round(float64(len(mono)) * float64(targetRate) / float64(inputRate)))
+	if outputLen <= 0 {
+		return nil
+	}
+
+	out := make([]float32, outputLen)
+	scale := float64(inputRate) / float64(targetRate)
+	for i := 0; i < outputLen; i++ {
+		srcPos := float64(i) * scale
+		srcIndex := int(srcPos)
+		if srcIndex >= len(mono)-1 {
+			out[i] = mono[len(mono)-1]
+			continue
+		}
+		frac := float32(srcPos - float64(srcIndex))
+		out[i] = mono[srcIndex]*(1-frac) + mono[srcIndex+1]*frac
+	}
+	return out
+}
+
+func buildAudioUserText(transcript string) string {
+	return "Transcribed user speech:\n" + strings.TrimSpace(transcript)
+}
+
+func normalizeOpenAIBaseURL(baseURL string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if strings.HasSuffix(trimmed, "/v1") {
+		return trimmed
+	}
+	return trimmed + "/v1"
+}
+
 func loadCfg() cfg {
 	var role, bridgeURL, peerID string
-	var audioChunkMs int
 	flag.StringVar(&role, "role", "callee", "Role: caller or callee")
 	flag.StringVar(&bridgeURL, "bridge-url", "http://127.0.0.1:8080", "Bridge base URL")
 	flag.StringVar(&peerID, "peer-id", "", "Optional peer identifier for TURN username")
-	flag.IntVar(&audioChunkMs, "audio-chunk-ms", 1000, "Duration of streamed audio chunks in milliseconds")
 	flag.Parse()
 
 	role = strings.TrimSpace(role)
 	bridgeURL = strings.TrimRight(strings.TrimSpace(bridgeURL), "/")
-
-	if role != "caller" && role != "callee" {
-		log.Fatal("-role must be caller or callee")
-	}
-	if bridgeURL == "" {
-		log.Fatal("-bridge-url is required")
-	}
-	if audioChunkMs <= 0 {
-		log.Fatal("-audio-chunk-ms must be greater than zero")
-	}
 
 	if override := strings.TrimSpace(os.Getenv("BRIDGE_URL")); override != "" {
 		bridgeURL = strings.TrimRight(override, "/")
@@ -781,12 +965,11 @@ func loadCfg() cfg {
 	if overridePeerID := strings.TrimSpace(os.Getenv("PEER_ID")); overridePeerID != "" {
 		peerID = overridePeerID
 	}
-	if overrideAudioChunkMs := strings.TrimSpace(os.Getenv("PION_AGENT_AUDIO_CHUNK_MS")); overrideAudioChunkMs != "" {
-		parsed, err := strconv.Atoi(overrideAudioChunkMs)
-		if err != nil || parsed <= 0 {
-			log.Fatalf("invalid PION_AGENT_AUDIO_CHUNK_MS: %q", overrideAudioChunkMs)
-		}
-		audioChunkMs = parsed
+	if role != "caller" && role != "callee" {
+		log.Fatal("-role must be caller or callee")
+	}
+	if bridgeURL == "" {
+		log.Fatal("-bridge-url is required")
 	}
 	if peerID == "" {
 		peerID = fmt.Sprintf("%s-%d", role, time.Now().Unix())
@@ -795,11 +978,143 @@ func loadCfg() cfg {
 	callID := uuid.NewString()
 	log.Printf("generated call id: %s", callID)
 
-	return cfg{
-		bridgeURL:    bridgeURL,
-		callID:       callID,
-		role:         role,
-		peerID:       peerID,
-		audioChunkMs: audioChunkMs,
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		log.Fatalf("resolve repo root: %v", err)
 	}
+
+	onnxRuntimeLibPath := strings.TrimSpace(os.Getenv("ONNX_RUNTIME_LIB_PATH"))
+	if onnxRuntimeLibPath == "" {
+		candidates := []string{
+			"/opt/homebrew/lib/libonnxruntime.dylib",
+			"/usr/local/lib/libonnxruntime.dylib",
+			filepath.Join(repoRoot, "libonnxruntime.dylib"),
+		}
+		for _, candidate := range candidates {
+			if _, statErr := os.Stat(candidate); statErr == nil {
+				onnxRuntimeLibPath = candidate
+				break
+			}
+		}
+		if onnxRuntimeLibPath == "" {
+			onnxRuntimeLibPath = candidates[0]
+		}
+	}
+
+	sileroModelPath := strings.TrimSpace(os.Getenv("SILERO_VAD_MODEL_PATH"))
+	if sileroModelPath == "" {
+		sileroModelPath = filepath.Join(repoRoot, "models", "silero_vad.onnx")
+	}
+
+	vadSpeechThreshold := parseEnvFloat("SILERO_VAD_SPEECH_THRESHOLD", 0.5)
+	vadNoiseThreshold := parseEnvFloat("SILERO_VAD_NOISE_THRESHOLD", maxFloat64(vadSpeechThreshold-0.15, 0.01))
+	vadMinSilenceMs := parseEnvInt("SILERO_VAD_MIN_SILENCE_MS", 100)
+	vadSpeechPadMs := parseEnvInt("SILERO_VAD_SPEECH_PAD_MS", 30)
+
+	log.Printf(
+		"silero config speech_threshold=%.2f noise_threshold=%.2f min_silence_ms=%d speech_pad_ms=%d sample_rate=%d",
+		vadSpeechThreshold,
+		vadNoiseThreshold,
+		vadMinSilenceMs,
+		vadSpeechPadMs,
+		targetVADSampleRate,
+	)
+
+	sttBaseURL := strings.TrimSpace(os.Getenv("PION_STT_BASE_URL"))
+	if sttBaseURL == "" {
+		sttBaseURL = strings.TrimSpace(os.Getenv("AGENT_STT_BASE_URL"))
+	}
+	if sttBaseURL == "" {
+		sttBaseURL = defaultSttBaseURL
+	}
+
+	sttModel := strings.TrimSpace(os.Getenv("PION_STT_MODEL"))
+	if sttModel == "" {
+		sttModel = strings.TrimSpace(os.Getenv("AGENT_STT_MODEL"))
+	}
+	if sttModel == "" {
+		sttModel = defaultSttModel
+	}
+
+	sttAPIKey := strings.TrimSpace(os.Getenv("PION_STT_API_KEY"))
+	if sttAPIKey == "" {
+		sttAPIKey = strings.TrimSpace(os.Getenv("AGENT_STT_API_KEY"))
+	}
+	if sttAPIKey == "" {
+		sttAPIKey = defaultSttAPIKey
+	}
+
+	sttLanguage := strings.TrimSpace(os.Getenv("PION_STT_LANGUAGE"))
+	if sttLanguage == "" {
+		sttLanguage = strings.TrimSpace(os.Getenv("AGENT_STT_LANGUAGE"))
+	}
+
+	return cfg{
+		bridgeURL:          bridgeURL,
+		callID:             callID,
+		role:               role,
+		peerID:             peerID,
+		sttBaseURL:         sttBaseURL,
+		sttModel:           sttModel,
+		sttAPIKey:          sttAPIKey,
+		sttLanguage:        sttLanguage,
+		onnxRuntimeLibPath: onnxRuntimeLibPath,
+		sileroModelPath:    sileroModelPath,
+		vadSpeechThreshold: vadSpeechThreshold,
+		vadNoiseThreshold:  vadNoiseThreshold,
+		vadMinSilenceMs:    vadMinSilenceMs,
+		vadSpeechPadMs:     vadSpeechPadMs,
+	}
+}
+
+func parseEnvInt(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Fatalf("invalid %s: %q", name, raw)
+	}
+	return parsed
+}
+
+func maxFloat64(a, b float64) float64 {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func parseEnvFloat(name string, fallback float64) float64 {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		log.Fatalf("invalid %s: %q", name, raw)
+	}
+	return parsed
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func minFloat(a, b float32) float32 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxFloat(a, b float32) float32 {
+	if a > b {
+		return a
+	}
+	return b
 }

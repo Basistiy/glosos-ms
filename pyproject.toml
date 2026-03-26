@@ -4,15 +4,12 @@ version = "0.1.0"
 description = "Local bridge-managed agent runtime for glosos-ms"
 requires-python = ">=3.10"
 dependencies = [
-  "av>=17.0.0",
   "fastapi>=0.116.0",
-  "google-cloud-speech>=2.33.0",
   "mlx-audio",
   "mlx-lm",
+  "openai>=1.0.0",
   "python-multipart>=0.0.20",
-  "silero-vad>=6.2.1",
-  "smolagents[openai]",
-  "torch>=2.11.0",
+  "setuptools<81",
   "uvicorn>=0.35.0",
   "webrtcvad>=2.0.10",
 ]
