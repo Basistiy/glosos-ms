@@ -26,6 +26,7 @@ import (
 	"gopkg.in/hraban/opus.v2"
 
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 	"glosos-ms/internal/silerovad"
 )
 
@@ -33,6 +34,9 @@ const (
 	defaultSttBaseURL         = "http://127.0.0.1:8001/v1"
 	defaultSttModel           = "mlx-community/Qwen3-ASR-0.6B-4bit"
 	defaultSttAPIKey          = "mlx-audio"
+	defaultTtsModel           = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit"
+	targetTTSSampleRate       = 48000
+	targetTTSChannels         = 2
 	targetVADSampleRate       = 16000
 	maxOpusFrameMillis        = 60
 )
@@ -46,6 +50,11 @@ type cfg struct {
 	sttModel           string
 	sttAPIKey          string
 	sttLanguage        string
+	ttsBaseURL         string
+	ttsModel           string
+	ttsAPIKey          string
+	ttsVoice           string
+	ttsLanguage        string
 	onnxRuntimeLibPath string
 	sileroModelPath    string
 	vadSpeechThreshold float64
@@ -88,6 +97,13 @@ type transcriptionResponse struct {
 	Text string `json:"text"`
 }
 
+type speechResponseRequest struct {
+	Model          string `json:"model"`
+	Input          string `json:"input"`
+	Voice          string `json:"voice,omitempty"`
+	ResponseFormat string `json:"response_format"`
+}
+
 type pendingCandidate struct {
 	Candidate        string
 	SDPMid           *string
@@ -105,6 +121,7 @@ type remoteCandidateGate struct {
 type speechPipeline struct {
 	sttClient    *http.Client
 	agentClient  *http.Client
+	ttsStreamer  *ttsStreamer
 	config       cfg
 	getDC        func() *webrtc.DataChannel
 	bridgeURL    string
@@ -118,6 +135,14 @@ type speechPipeline struct {
 	bufferOffset int
 	segmentStart int
 	processMu    sync.Mutex
+}
+
+type ttsStreamer struct {
+	client  *http.Client
+	config  cfg
+	track   *webrtc.TrackLocalStaticSample
+	encoder *opus.Encoder
+	mu      sync.Mutex
 }
 
 func newRemoteCandidateGate() *remoteCandidateGate {
@@ -160,6 +185,7 @@ func (g *remoteCandidateGate) markReadyAndFlush(pc *webrtc.PeerConnection) {
 func newSpeechPipeline(
 	sttClient *http.Client,
 	agentClient *http.Client,
+	ttsStreamer *ttsStreamer,
 	getDC func() *webrtc.DataChannel,
 	config cfg,
 	track *webrtc.TrackRemote,
@@ -188,6 +214,7 @@ func newSpeechPipeline(
 	pipeline := &speechPipeline{
 		sttClient:    sttClient,
 		agentClient:  agentClient,
+		ttsStreamer:  ttsStreamer,
 		config:       config,
 		getDC:        getDC,
 		bridgeURL:    config.bridgeURL,
@@ -340,6 +367,11 @@ func (p *speechPipeline) processSegment(samples []float32) {
 		log.Printf("agent send error: %v", err)
 		return
 	}
+	if p.ttsStreamer != nil {
+		if err := p.ttsStreamer.Speak(reply); err != nil {
+			log.Printf("tts speak error: %v", err)
+		}
+	}
 	log.Printf("sent agent response")
 	log.Printf("[timing] stage=go_audio_turn total_ms=%d", time.Since(turnStartedAt).Milliseconds())
 }
@@ -388,6 +420,7 @@ func main() {
 	client := &http.Client{Timeout: 20 * time.Second}
 	sttClient := &http.Client{Timeout: 2 * time.Minute}
 	agentClient := &http.Client{Timeout: 2 * time.Minute}
+	ttsClient := &http.Client{Timeout: 2 * time.Minute}
 
 	var currentDC struct {
 		sync.RWMutex
@@ -437,7 +470,13 @@ func main() {
 		_ = postJSON(client, fmt.Sprintf("%s/session/%s/stop", config.bridgeURL, config.callID), map[string]any{}, nil)
 	}()
 
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{
+	mediaEngine := &webrtc.MediaEngine{}
+	if err := mediaEngine.RegisterDefaultCodecs(); err != nil {
+		log.Fatalf("register default codecs: %v", err)
+	}
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(mediaEngine))
+
+	pc, err := api.NewPeerConnection(webrtc.Configuration{
 		ICEServers: iceServers,
 	})
 	if err != nil {
@@ -448,6 +487,29 @@ func main() {
 			log.Printf("peer close error: %v", closeErr)
 		}
 	}()
+
+	ttsTrack, err := webrtc.NewTrackLocalStaticSample(
+		webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypeOpus,
+			ClockRate: targetTTSSampleRate,
+			Channels:  targetTTSChannels,
+		},
+		"audio",
+		"glosos-tts",
+	)
+	if err != nil {
+		log.Fatalf("create tts track: %v", err)
+	}
+	sender, err := pc.AddTrack(ttsTrack)
+	if err != nil {
+		log.Fatalf("add tts track: %v", err)
+	}
+	go drainRTCP(sender)
+
+	ttsStreamer, err := newTTSStreamer(ttsClient, config, ttsTrack)
+	if err != nil {
+		log.Fatalf("create tts streamer: %v", err)
+	}
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("peer state: %s", state.String())
@@ -488,7 +550,7 @@ func main() {
 			return
 		}
 
-		pipeline, err := newSpeechPipeline(sttClient, agentClient, getCurrentDC, config, track)
+		pipeline, err := newSpeechPipeline(sttClient, agentClient, ttsStreamer, getCurrentDC, config, track)
 		if err != nil {
 			log.Printf("create speech pipeline error: %v", err)
 			return
@@ -727,6 +789,79 @@ func wireDC(client *http.Client, config cfg, dc *webrtc.DataChannel) {
 	})
 }
 
+func newTTSStreamer(client *http.Client, config cfg, track *webrtc.TrackLocalStaticSample) (*ttsStreamer, error) {
+	encoder, err := opus.NewEncoder(targetTTSSampleRate, targetTTSChannels, opus.AppVoIP)
+	if err != nil {
+		return nil, fmt.Errorf("create opus encoder: %w", err)
+	}
+	return &ttsStreamer{
+		client:  client,
+		config:  config,
+		track:   track,
+		encoder: encoder,
+	}, nil
+}
+
+func (s *ttsStreamer) Speak(text string) error {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	startedAt := time.Now()
+	audioBytes, err := synthesizeSpeech(s.client, s.config, trimmed)
+	if err != nil {
+		return err
+	}
+	pcm, sampleRate, channels, err := decodeWAVPCM16(audioBytes)
+	if err != nil {
+		return err
+	}
+	mono := pcm16ToFloat32Mono(pcm, channels)
+	resampled := resampleMonoFloat32(mono, sampleRate, targetTTSSampleRate)
+	if len(resampled) == 0 {
+		return fmt.Errorf("empty synthesized audio")
+	}
+	if err := s.writeOpusSamples(resampled); err != nil {
+		return err
+	}
+	log.Printf("[timing] stage=go_audio_tts text_chars=%d tts_ms=%d", len(trimmed), time.Since(startedAt).Milliseconds())
+	return nil
+}
+
+func (s *ttsStreamer) writeOpusSamples(samples []float32) error {
+	frameSize := targetTTSSampleRate / 50
+	pcmFrame := make([]int16, frameSize*targetTTSChannels)
+	opusBuf := make([]byte, 4000)
+
+	for offset := 0; offset < len(samples); offset += frameSize {
+		clear(pcmFrame)
+		end := minInt(offset+frameSize, len(samples))
+		for i := offset; i < end; i++ {
+			value := float32ToPCM16(samples[i])
+			frameIndex := (i - offset) * targetTTSChannels
+			for ch := 0; ch < targetTTSChannels; ch++ {
+				pcmFrame[frameIndex+ch] = value
+			}
+		}
+
+		n, err := s.encoder.Encode(pcmFrame, opusBuf)
+		if err != nil {
+			return fmt.Errorf("encode opus: %w", err)
+		}
+		if err := s.track.WriteSample(media.Sample{
+			Data:     append([]byte(nil), opusBuf[:n]...),
+			Duration: 20 * time.Millisecond,
+		}); err != nil {
+			return fmt.Errorf("write opus sample: %w", err)
+		}
+	}
+	return nil
+}
+
 func runAgentChat(client *http.Client, bridgeURL string, message string) (string, error) {
 	resp := agentChatResponse{}
 	if err := postJSON(client, bridgeURL+"/agent/chat", map[string]any{
@@ -735,6 +870,49 @@ func runAgentChat(client *http.Client, bridgeURL string, message string) (string
 		return "", err
 	}
 	return resp.Response, nil
+}
+
+func synthesizeSpeech(client *http.Client, cfg cfg, text string) ([]byte, error) {
+	requestBody := speechResponseRequest{
+		Model:          cfg.ttsModel,
+		Input:          text,
+		ResponseFormat: "wav",
+	}
+	if cfg.ttsVoice != "" {
+		requestBody.Voice = cfg.ttsVoice
+	}
+
+	body, err := json.Marshal(requestBody)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequest(http.MethodPost, normalizeOpenAIBaseURL(cfg.ttsBaseURL)+"/audio/speech", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "audio/wav")
+	if strings.TrimSpace(cfg.ttsAPIKey) != "" {
+		req.Header.Set("Authorization", "Bearer "+cfg.ttsAPIKey)
+	}
+
+	query := req.URL.Query()
+	if lang := resolveTTSLanguage(cfg.ttsLanguage, text); lang != "" {
+		query.Set("lang_code", lang)
+	}
+	req.URL.RawQuery = query.Encode()
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(raw)))
+	}
+	return io.ReadAll(resp.Body)
 }
 
 func transcribeSpeechSegment(client *http.Client, cfg cfg, wavBytes []byte) (string, error) {
@@ -785,6 +963,15 @@ func transcribeSpeechSegment(client *http.Client, cfg cfg, wavBytes []byte) (str
 		return "", err
 	}
 	return strings.TrimSpace(transcription.Text), nil
+}
+
+func drainRTCP(sender *webrtc.RTPSender) {
+	rtcpBuf := make([]byte, 1500)
+	for {
+		if _, _, err := sender.Read(rtcpBuf); err != nil {
+			return
+		}
+	}
 }
 
 func postJSON(client *http.Client, url string, payload any, out any) error {
@@ -888,6 +1075,65 @@ func encodePCM16WAV(samples []float32, sampleRate int) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
+func decodeWAVPCM16(raw []byte) ([]int16, int, int, error) {
+	if len(raw) < 44 {
+		return nil, 0, 0, fmt.Errorf("wav too short")
+	}
+	if string(raw[0:4]) != "RIFF" || string(raw[8:12]) != "WAVE" {
+		return nil, 0, 0, fmt.Errorf("unsupported wav header")
+	}
+
+	var (
+		audioFormat uint16
+		channels    uint16
+		sampleRate  uint32
+		data        []byte
+	)
+
+	offset := 12
+	for offset+8 <= len(raw) {
+		chunkID := string(raw[offset : offset+4])
+		chunkSize := int(binary.LittleEndian.Uint32(raw[offset+4 : offset+8]))
+		offset += 8
+		if offset+chunkSize > len(raw) {
+			return nil, 0, 0, fmt.Errorf("invalid wav chunk size")
+		}
+
+		switch chunkID {
+		case "fmt ":
+			if chunkSize < 16 {
+				return nil, 0, 0, fmt.Errorf("invalid fmt chunk")
+			}
+			audioFormat = binary.LittleEndian.Uint16(raw[offset : offset+2])
+			channels = binary.LittleEndian.Uint16(raw[offset+2 : offset+4])
+			sampleRate = binary.LittleEndian.Uint32(raw[offset+4 : offset+8])
+		case "data":
+			data = raw[offset : offset+chunkSize]
+		}
+
+		offset += chunkSize
+		if chunkSize%2 == 1 {
+			offset++
+		}
+	}
+
+	if audioFormat != 1 {
+		return nil, 0, 0, fmt.Errorf("unsupported wav format: %d", audioFormat)
+	}
+	if channels == 0 || sampleRate == 0 || len(data) == 0 {
+		return nil, 0, 0, fmt.Errorf("incomplete wav data")
+	}
+	if len(data)%2 != 0 {
+		return nil, 0, 0, fmt.Errorf("invalid pcm16 data length")
+	}
+
+	samples := make([]int16, len(data)/2)
+	for i := 0; i < len(samples); i++ {
+		samples[i] = int16(binary.LittleEndian.Uint16(data[i*2 : i*2+2]))
+	}
+	return samples, int(sampleRate), int(channels), nil
+}
+
 func resampleToMono(samples []float32, inputRate int, channels int, targetRate int) []float32 {
 	if channels <= 0 || len(samples) == 0 {
 		return nil
@@ -934,8 +1180,62 @@ func resampleToMono(samples []float32, inputRate int, channels int, targetRate i
 	return out
 }
 
+func pcm16ToFloat32Mono(samples []int16, channels int) []float32 {
+	if channels <= 0 || len(samples) == 0 {
+		return nil
+	}
+	frames := len(samples) / channels
+	out := make([]float32, frames)
+	if channels == 1 {
+		for i := range out {
+			out[i] = float32(samples[i]) / 32768.0
+		}
+		return out
+	}
+	for i := 0; i < frames; i++ {
+		var sum float32
+		for ch := 0; ch < channels; ch++ {
+			sum += float32(samples[i*channels+ch]) / 32768.0
+		}
+		out[i] = sum / float32(channels)
+	}
+	return out
+}
+
+func resampleMonoFloat32(samples []float32, inputRate int, targetRate int) []float32 {
+	if len(samples) == 0 || inputRate <= 0 || targetRate <= 0 {
+		return nil
+	}
+	if inputRate == targetRate {
+		return append([]float32(nil), samples...)
+	}
+
+	outputLen := int(math.Round(float64(len(samples)) * float64(targetRate) / float64(inputRate)))
+	if outputLen <= 0 {
+		return nil
+	}
+
+	out := make([]float32, outputLen)
+	scale := float64(inputRate) / float64(targetRate)
+	for i := 0; i < outputLen; i++ {
+		srcPos := float64(i) * scale
+		srcIndex := int(srcPos)
+		if srcIndex >= len(samples)-1 {
+			out[i] = samples[len(samples)-1]
+			continue
+		}
+		frac := float32(srcPos - float64(srcIndex))
+		out[i] = samples[srcIndex]*(1-frac) + samples[srcIndex+1]*frac
+	}
+	return out
+}
+
 func buildAudioUserText(transcript string) string {
-	return "Transcribed user speech:\n" + strings.TrimSpace(transcript)
+	return strings.TrimSpace(
+		"The following text is an automatic speech transcription from the user. " +
+			"Respond to the user's meaning directly. Do not repeat the transcript back verbatim unless the user explicitly asked for transcription.\n\n" +
+			"User speech transcript:\n" + strings.TrimSpace(transcript),
+	)
 }
 
 func normalizeOpenAIBaseURL(baseURL string) string {
@@ -1049,6 +1349,40 @@ func loadCfg() cfg {
 		sttLanguage = strings.TrimSpace(os.Getenv("AGENT_STT_LANGUAGE"))
 	}
 
+	ttsBaseURL := strings.TrimSpace(os.Getenv("PION_TTS_BASE_URL"))
+	if ttsBaseURL == "" {
+		ttsBaseURL = strings.TrimSpace(os.Getenv("AGENT_TTS_BASE_URL"))
+	}
+	if ttsBaseURL == "" {
+		ttsBaseURL = sttBaseURL
+	}
+
+	ttsModel := strings.TrimSpace(os.Getenv("PION_TTS_MODEL"))
+	if ttsModel == "" {
+		ttsModel = strings.TrimSpace(os.Getenv("AGENT_TTS_MODEL"))
+	}
+	if ttsModel == "" {
+		ttsModel = defaultTtsModel
+	}
+
+	ttsAPIKey := strings.TrimSpace(os.Getenv("PION_TTS_API_KEY"))
+	if ttsAPIKey == "" {
+		ttsAPIKey = strings.TrimSpace(os.Getenv("AGENT_TTS_API_KEY"))
+	}
+	if ttsAPIKey == "" {
+		ttsAPIKey = sttAPIKey
+	}
+
+	ttsVoice := strings.TrimSpace(os.Getenv("PION_TTS_VOICE"))
+	if ttsVoice == "" {
+		ttsVoice = strings.TrimSpace(os.Getenv("AGENT_TTS_VOICE"))
+	}
+
+	ttsLanguage := strings.TrimSpace(os.Getenv("PION_TTS_LANGUAGE"))
+	if ttsLanguage == "" {
+		ttsLanguage = strings.TrimSpace(os.Getenv("AGENT_TTS_LANGUAGE"))
+	}
+
 	return cfg{
 		bridgeURL:          bridgeURL,
 		callID:             callID,
@@ -1058,6 +1392,11 @@ func loadCfg() cfg {
 		sttModel:           sttModel,
 		sttAPIKey:          sttAPIKey,
 		sttLanguage:        sttLanguage,
+		ttsBaseURL:         ttsBaseURL,
+		ttsModel:           ttsModel,
+		ttsAPIKey:          ttsAPIKey,
+		ttsVoice:           ttsVoice,
+		ttsLanguage:        ttsLanguage,
 		onnxRuntimeLibPath: onnxRuntimeLibPath,
 		sileroModelPath:    sileroModelPath,
 		vadSpeechThreshold: vadSpeechThreshold,
@@ -1105,6 +1444,13 @@ func maxInt(a, b int) int {
 	return b
 }
 
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func minFloat(a, b float32) float32 {
 	if a < b {
 		return a
@@ -1117,4 +1463,21 @@ func maxFloat(a, b float32) float32 {
 		return a
 	}
 	return b
+}
+
+func float32ToPCM16(sample float32) int16 {
+	clamped := maxFloat(-1, minFloat(1, sample))
+	return int16(math.Round(float64(clamped * 32767)))
+}
+
+func resolveTTSLanguage(configured string, text string) string {
+	if strings.TrimSpace(configured) != "" {
+		return strings.TrimSpace(configured)
+	}
+	for _, r := range text {
+		if r >= 0x0400 && r <= 0x04FF {
+			return "ru"
+		}
+	}
+	return "en"
 }
