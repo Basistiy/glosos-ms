@@ -31,7 +31,7 @@ import (
 
 const (
 	defaultSttBaseURL         = "http://127.0.0.1:8001/v1"
-	defaultSttModel           = "mlx-community/whisper-large-v3-turbo-asr-fp16"
+	defaultSttModel           = "mlx-community/Qwen3-ASR-0.6B-4bit"
 	defaultSttAPIKey          = "mlx-audio"
 	targetVADSampleRate       = 16000
 	maxOpusFrameMillis        = 60

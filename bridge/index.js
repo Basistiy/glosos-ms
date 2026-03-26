@@ -88,7 +88,7 @@ const config = {
   agentSttProvider: (process.env.AGENT_STT_PROVIDER || "mlx_audio").trim(),
   agentSttBaseUrl: (process.env.AGENT_STT_BASE_URL || "").trim(),
   agentSttApiKey: (process.env.AGENT_STT_API_KEY || "mlx-audio").trim(),
-  agentSttModel: (process.env.AGENT_STT_MODEL || "mlx-community/whisper-large-v3-turbo-asr-fp16").trim(),
+  agentSttModel: (process.env.AGENT_STT_MODEL || "mlx-community/Qwen3-ASR-0.6B-4bit").trim(),
   agentSttLanguage: (process.env.AGENT_STT_LANGUAGE || "").trim(),
   googleSttProjectId: (process.env.GOOGLE_STT_PROJECT_ID || "").trim(),
   googleSttLocation: (process.env.GOOGLE_STT_LOCATION || "global").trim(),
