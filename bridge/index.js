@@ -65,7 +65,7 @@ const config = {
   port: intEnv("BRIDGE_PORT", 8080),
   autoStartMlxServer: (process.env.AUTO_START_MLX_SERVER || "1").trim() !== "0",
   mlxRunnerCommand: (process.env.MLX_RUNNER_COMMAND || "uv").trim(),
-  mlxModel: (process.env.MLX_MODEL || "mlx-community/Orchestrator-8B-6bit").trim(),
+  mlxModel: (process.env.MLX_MODEL || "mlx-community/Qwen3-4B-Instruct-2507-4bit").trim(),
   mlxHost: (process.env.MLX_HOST || "127.0.0.1").trim(),
   mlxPort: intEnv("MLX_PORT", 8000),
   mlxRestartDelayMs: intEnv("MLX_RESTART_DELAY_MS", 3000),

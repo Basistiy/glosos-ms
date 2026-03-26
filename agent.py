@@ -8,7 +8,7 @@ from typing import Any
 from openai import OpenAI
 
 
-DEFAULT_MODEL = "mlx-community/Orchestrator-8B-6bit"
+DEFAULT_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
 DEFAULT_API_BASE = "http://127.0.0.1:8000/v1"
 DEFAULT_API_KEY = "mlx-local"
 DEFAULT_SYSTEM_PROMPT = (
