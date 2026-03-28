@@ -8,6 +8,7 @@ dependencies = [
   "mlx-audio",
   "mlx-lm",
   "openai>=1.0.0",
+  "phonemizer>=3.3.0",
   "python-multipart>=0.0.20",
   "setuptools<81",
   "uvicorn>=0.35.0",

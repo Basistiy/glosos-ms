@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -31,14 +33,18 @@ import (
 )
 
 const (
-	defaultSttBaseURL         = "http://127.0.0.1:8001/v1"
-	defaultSttModel           = "mlx-community/Qwen3-ASR-0.6B-4bit"
-	defaultSttAPIKey          = "mlx-audio"
-	defaultTtsModel           = "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit"
-	targetTTSSampleRate       = 48000
-	targetTTSChannels         = 2
-	targetVADSampleRate       = 16000
-	maxOpusFrameMillis        = 60
+	defaultSttBaseURL   = "http://127.0.0.1:8001/v1"
+	defaultSttModel     = "mlx-community/Qwen3-ASR-0.6B-4bit"
+	defaultSttAPIKey    = "mlx-audio"
+	defaultTtsModel     = "mlx-community/kitten-tts-mini-0.8-8bit"
+	defaultSttLanguage  = "en"
+	defaultTtsLanguage  = "en"
+	defaultTtsVoice     = "expr-voice-5-m"
+	targetTTSSampleRate = 48000
+	targetTTSChannels   = 2
+	targetVADSampleRate = 16000
+	maxOpusFrameMillis  = 60
+	ttsFrameDuration    = 20 * time.Millisecond
 )
 
 type cfg struct {
@@ -55,12 +61,16 @@ type cfg struct {
 	ttsAPIKey          string
 	ttsVoice           string
 	ttsLanguage        string
+	ttsMaxChars        int
+	warmupEnabled      bool
+	warmupText         string
 	onnxRuntimeLibPath string
 	sileroModelPath    string
 	vadSpeechThreshold float64
 	vadNoiseThreshold  float64
 	vadMinSilenceMs    int
 	vadSpeechPadMs     int
+	vadMinSpeechMs     int
 }
 
 type remoteDescriptionResponse struct {
@@ -138,11 +148,29 @@ type speechPipeline struct {
 }
 
 type ttsStreamer struct {
-	client  *http.Client
-	config  cfg
+	client     *http.Client
+	config     cfg
+	track      *webrtc.TrackLocalStaticSample
+	encoder    *opus.Encoder
+	mu         sync.Mutex
+	cancelMu   sync.Mutex
+	activeStop context.CancelFunc
+	generation atomic.Uint64
+}
+
+type wavStream struct {
+	body       io.ReadCloser
+	reader     *bufio.Reader
+	sampleRate int
+	channels   int
+	pendingPCM []byte
+}
+
+type opusFrameWriter struct {
 	track   *webrtc.TrackLocalStaticSample
 	encoder *opus.Encoder
-	mu      sync.Mutex
+	pending []float32
+	nextAt  time.Time
 }
 
 func newRemoteCandidateGate() *remoteCandidateGate {
@@ -291,6 +319,9 @@ func (p *speechPipeline) onSpeechSegment(start, end silerovad.SampleOffset) {
 	defer p.bufferMu.Unlock()
 
 	if start != silerovad.InvalidSampleOffset {
+		if p.ttsStreamer != nil {
+			p.ttsStreamer.Interrupt()
+		}
 		p.segmentStart = int(start)
 	}
 
@@ -327,6 +358,19 @@ func (p *speechPipeline) onSpeechSegment(start, end silerovad.SampleOffset) {
 func (p *speechPipeline) processSegment(samples []float32) {
 	p.processMu.Lock()
 	defer p.processMu.Unlock()
+	if len(samples) == 0 {
+		return
+	}
+
+	segmentDurationMs := (len(samples) * 1000) / targetVADSampleRate
+	if segmentDurationMs < p.config.vadMinSpeechMs {
+		log.Printf(
+			"[timing] stage=go_audio_vad_skip duration_ms=%d min_speech_ms=%d",
+			segmentDurationMs,
+			p.config.vadMinSpeechMs,
+		)
+		return
+	}
 
 	turnStartedAt := time.Now()
 	wavBytes, err := encodePCM16WAV(samples, targetVADSampleRate)
@@ -367,13 +411,15 @@ func (p *speechPipeline) processSegment(samples []float32) {
 		log.Printf("agent send error: %v", err)
 		return
 	}
-	if p.ttsStreamer != nil {
-		if err := p.ttsStreamer.Speak(reply); err != nil {
-			log.Printf("tts speak error: %v", err)
-		}
-	}
 	log.Printf("sent agent response")
 	log.Printf("[timing] stage=go_audio_turn total_ms=%d", time.Since(turnStartedAt).Milliseconds())
+	if p.ttsStreamer != nil {
+		go func(reply string) {
+			if err := p.ttsStreamer.Speak(reply); err != nil {
+				log.Printf("tts speak error: %v", err)
+			}
+		}(reply)
+	}
 }
 
 func forwardTrack(pipeline *speechPipeline, track *webrtc.TrackRemote) {
@@ -509,6 +555,9 @@ func main() {
 	ttsStreamer, err := newTTSStreamer(ttsClient, config, ttsTrack)
 	if err != nil {
 		log.Fatalf("create tts streamer: %v", err)
+	}
+	if config.warmupEnabled {
+		go warmupSpeechStack(sttClient, ttsStreamer, config)
 	}
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
@@ -807,58 +856,186 @@ func (s *ttsStreamer) Speak(text string) error {
 	if trimmed == "" {
 		return nil
 	}
+	spokenText := shortenForSpeech(trimmed, s.config.ttsMaxChars)
+	if spokenText == "" {
+		return nil
+	}
+	generation := s.generation.Add(1)
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.isCurrent(generation) {
+		return nil
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.setActiveCancel(cancel)
+	defer s.clearActiveCancel()
 
 	startedAt := time.Now()
-	audioBytes, err := synthesizeSpeech(s.client, s.config, trimmed)
+	stream, err := openSpeechStream(ctx, s.client, s.config, spokenText)
 	if err != nil {
+		if ctx.Err() != nil || !s.isCurrent(generation) {
+			return nil
+		}
 		return err
 	}
-	pcm, sampleRate, channels, err := decodeWAVPCM16(audioBytes)
-	if err != nil {
+	defer stream.Close()
+
+	frameWriter := newOpusFrameWriter(s.track, s.encoder)
+	firstChunkLogged := false
+	for {
+		if !s.isCurrent(generation) {
+			return nil
+		}
+		pcm, readErr := stream.ReadPCM16Chunk(4096)
+		if len(pcm) > 0 {
+			mono := pcm16ToFloat32Mono(pcm, stream.channels)
+			resampled := resampleMonoFloat32(mono, stream.sampleRate, targetTTSSampleRate)
+			if len(resampled) > 0 {
+				if !firstChunkLogged {
+					log.Printf(
+						"[timing] stage=go_audio_tts_first_audio text_chars=%d spoken_chars=%d first_audio_ms=%d",
+						len(trimmed),
+						len(spokenText),
+						time.Since(startedAt).Milliseconds(),
+					)
+					firstChunkLogged = true
+				}
+				if err := frameWriter.Write(resampled, generation, s.isCurrent); err != nil {
+					return err
+				}
+			}
+		}
+		if readErr == nil {
+			continue
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if ctx.Err() != nil || !s.isCurrent(generation) {
+			return nil
+		}
+		return readErr
+	}
+	if !s.isCurrent(generation) {
+		return nil
+	}
+	if err := frameWriter.Flush(generation, s.isCurrent); err != nil {
 		return err
 	}
-	mono := pcm16ToFloat32Mono(pcm, channels)
-	resampled := resampleMonoFloat32(mono, sampleRate, targetTTSSampleRate)
-	if len(resampled) == 0 {
-		return fmt.Errorf("empty synthesized audio")
-	}
-	if err := s.writeOpusSamples(resampled); err != nil {
-		return err
-	}
-	log.Printf("[timing] stage=go_audio_tts text_chars=%d tts_ms=%d", len(trimmed), time.Since(startedAt).Milliseconds())
+	log.Printf(
+		"[timing] stage=go_audio_tts text_chars=%d spoken_chars=%d tts_ms=%d",
+		len(trimmed),
+		len(spokenText),
+		time.Since(startedAt).Milliseconds(),
+	)
 	return nil
 }
 
-func (s *ttsStreamer) writeOpusSamples(samples []float32) error {
+func (s *ttsStreamer) Interrupt() {
+	s.generation.Add(1)
+	s.cancelMu.Lock()
+	cancel := s.activeStop
+	s.cancelMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (s *ttsStreamer) isCurrent(generation uint64) bool {
+	return s.generation.Load() == generation
+}
+
+func (s *ttsStreamer) setActiveCancel(cancel context.CancelFunc) {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+	s.activeStop = cancel
+}
+
+func (s *ttsStreamer) clearActiveCancel() {
+	s.cancelMu.Lock()
+	defer s.cancelMu.Unlock()
+	s.activeStop = nil
+}
+
+func newOpusFrameWriter(track *webrtc.TrackLocalStaticSample, encoder *opus.Encoder) *opusFrameWriter {
+	return &opusFrameWriter{
+		track:   track,
+		encoder: encoder,
+	}
+}
+
+func (w *opusFrameWriter) Write(samples []float32, generation uint64, isCurrent func(uint64) bool) error {
+	if len(samples) == 0 {
+		return nil
+	}
+	w.pending = append(w.pending, samples...)
+	frameSize := targetTTSSampleRate / 50
+	for len(w.pending) >= frameSize {
+		if !isCurrent(generation) {
+			w.pending = nil
+			return nil
+		}
+		if err := w.writeFrame(w.pending[:frameSize]); err != nil {
+			return err
+		}
+		w.pending = append([]float32(nil), w.pending[frameSize:]...)
+	}
+	return nil
+}
+
+func (w *opusFrameWriter) Flush(generation uint64, isCurrent func(uint64) bool) error {
+	if len(w.pending) == 0 {
+		return nil
+	}
+	if !isCurrent(generation) {
+		w.pending = nil
+		return nil
+	}
+	frameSize := targetTTSSampleRate / 50
+	frame := make([]float32, frameSize)
+	copy(frame, w.pending)
+	w.pending = nil
+	return w.writeFrame(frame)
+}
+
+func (w *opusFrameWriter) writeFrame(frame []float32) error {
 	frameSize := targetTTSSampleRate / 50
 	pcmFrame := make([]int16, frameSize*targetTTSChannels)
 	opusBuf := make([]byte, 4000)
 
-	for offset := 0; offset < len(samples); offset += frameSize {
-		clear(pcmFrame)
-		end := minInt(offset+frameSize, len(samples))
-		for i := offset; i < end; i++ {
-			value := float32ToPCM16(samples[i])
-			frameIndex := (i - offset) * targetTTSChannels
-			for ch := 0; ch < targetTTSChannels; ch++ {
-				pcmFrame[frameIndex+ch] = value
-			}
-		}
-
-		n, err := s.encoder.Encode(pcmFrame, opusBuf)
-		if err != nil {
-			return fmt.Errorf("encode opus: %w", err)
-		}
-		if err := s.track.WriteSample(media.Sample{
-			Data:     append([]byte(nil), opusBuf[:n]...),
-			Duration: 20 * time.Millisecond,
-		}); err != nil {
-			return fmt.Errorf("write opus sample: %w", err)
+	clear(pcmFrame)
+	end := minInt(len(frame), frameSize)
+	for i := 0; i < end; i++ {
+		value := float32ToPCM16(frame[i])
+		frameIndex := i * targetTTSChannels
+		for ch := 0; ch < targetTTSChannels; ch++ {
+			pcmFrame[frameIndex+ch] = value
 		}
 	}
+
+	n, err := w.encoder.Encode(pcmFrame, opusBuf)
+	if err != nil {
+		return fmt.Errorf("encode opus: %w", err)
+	}
+	if w.nextAt.IsZero() {
+		w.nextAt = time.Now()
+	} else {
+		now := time.Now()
+		if now.Before(w.nextAt) {
+			time.Sleep(time.Until(w.nextAt))
+		} else if now.Sub(w.nextAt) > 5*ttsFrameDuration {
+			// If chunk delivery was delayed or bursty, resync instead of trying to catch up instantly.
+			w.nextAt = now
+		}
+	}
+	if err := w.track.WriteSample(media.Sample{
+		Data:     append([]byte(nil), opusBuf[:n]...),
+		Duration: ttsFrameDuration,
+	}); err != nil {
+		return fmt.Errorf("write opus sample: %w", err)
+	}
+	w.nextAt = w.nextAt.Add(ttsFrameDuration)
 	return nil
 }
 
@@ -872,7 +1049,7 @@ func runAgentChat(client *http.Client, bridgeURL string, message string) (string
 	return resp.Response, nil
 }
 
-func synthesizeSpeech(client *http.Client, cfg cfg, text string) ([]byte, error) {
+func openSpeechStream(ctx context.Context, client *http.Client, cfg cfg, text string) (*wavStream, error) {
 	requestBody := speechResponseRequest{
 		Model:          cfg.ttsModel,
 		Input:          text,
@@ -886,7 +1063,12 @@ func synthesizeSpeech(client *http.Client, cfg cfg, text string) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, normalizeOpenAIBaseURL(cfg.ttsBaseURL)+"/audio/speech", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		normalizeOpenAIBaseURL(cfg.ttsBaseURL)+"/audio/speech",
+		bytes.NewReader(body),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -906,13 +1088,18 @@ func synthesizeSpeech(client *http.Client, cfg cfg, text string) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
 
 	if resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
 		return nil, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(raw)))
 	}
-	return io.ReadAll(resp.Body)
+	stream, err := newWAVStream(resp.Body)
+	if err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	return stream, nil
 }
 
 func transcribeSpeechSegment(client *http.Client, cfg cfg, wavBytes []byte) (string, error) {
@@ -1134,6 +1321,114 @@ func decodeWAVPCM16(raw []byte) ([]int16, int, int, error) {
 	return samples, int(sampleRate), int(channels), nil
 }
 
+func newWAVStream(body io.ReadCloser) (*wavStream, error) {
+	reader := bufio.NewReader(body)
+	header := make([]byte, 12)
+	if _, err := io.ReadFull(reader, header); err != nil {
+		return nil, fmt.Errorf("read wav header: %w", err)
+	}
+	if string(header[0:4]) != "RIFF" || string(header[8:12]) != "WAVE" {
+		return nil, fmt.Errorf("unsupported wav header")
+	}
+
+	var (
+		audioFormat uint16
+		channels    uint16
+		sampleRate  uint32
+		dataReader  io.Reader
+	)
+
+	for {
+		chunkHeader := make([]byte, 8)
+		if _, err := io.ReadFull(reader, chunkHeader); err != nil {
+			return nil, fmt.Errorf("read wav chunk header: %w", err)
+		}
+		chunkID := string(chunkHeader[:4])
+		chunkSize := binary.LittleEndian.Uint32(chunkHeader[4:8])
+
+		switch chunkID {
+		case "fmt ":
+			chunk := make([]byte, chunkSize)
+			if _, err := io.ReadFull(reader, chunk); err != nil {
+				return nil, fmt.Errorf("read wav fmt chunk: %w", err)
+			}
+			if len(chunk) < 16 {
+				return nil, fmt.Errorf("invalid wav fmt chunk")
+			}
+			audioFormat = binary.LittleEndian.Uint16(chunk[0:2])
+			channels = binary.LittleEndian.Uint16(chunk[2:4])
+			sampleRate = binary.LittleEndian.Uint32(chunk[4:8])
+		case "data":
+			if audioFormat != 1 {
+				return nil, fmt.Errorf("unsupported wav format: %d", audioFormat)
+			}
+			if channels == 0 || sampleRate == 0 {
+				return nil, fmt.Errorf("incomplete wav stream format")
+			}
+			dataReader = reader
+			if chunkSize > 0 {
+				dataReader = io.LimitReader(reader, int64(chunkSize))
+			}
+			return &wavStream{
+				body:       body,
+				reader:     bufio.NewReader(dataReader),
+				sampleRate: int(sampleRate),
+				channels:   int(channels),
+			}, nil
+		default:
+			if _, err := io.CopyN(io.Discard, reader, int64(chunkSize)); err != nil {
+				return nil, fmt.Errorf("skip wav chunk %q: %w", chunkID, err)
+			}
+		}
+
+		if chunkSize%2 == 1 {
+			if _, err := reader.ReadByte(); err != nil {
+				return nil, fmt.Errorf("skip wav padding: %w", err)
+			}
+		}
+	}
+}
+
+func (s *wavStream) ReadPCM16Chunk(maxBytes int) ([]int16, error) {
+	if maxBytes < 2 {
+		maxBytes = 2
+	}
+	if maxBytes%2 == 1 {
+		maxBytes--
+	}
+
+	buf := make([]byte, maxBytes)
+	n, err := s.reader.Read(buf)
+	if n == 0 {
+		if err == nil {
+			return nil, nil
+		}
+		return nil, err
+	}
+
+	data := append([]byte(nil), s.pendingPCM...)
+	data = append(data, buf[:n]...)
+	s.pendingPCM = nil
+	if len(data)%2 == 1 {
+		s.pendingPCM = append(s.pendingPCM, data[len(data)-1])
+		data = data[:len(data)-1]
+	}
+
+	samples := make([]int16, len(data)/2)
+	for i := range samples {
+		samples[i] = int16(binary.LittleEndian.Uint16(data[i*2 : i*2+2]))
+	}
+
+	if err == io.EOF && len(samples) > 0 {
+		return samples, io.EOF
+	}
+	return samples, err
+}
+
+func (s *wavStream) Close() error {
+	return s.body.Close()
+}
+
 func resampleToMono(samples []float32, inputRate int, channels int, targetRate int) []float32 {
 	if channels <= 0 || len(samples) == 0 {
 		return nil
@@ -1233,7 +1528,9 @@ func resampleMonoFloat32(samples []float32, inputRate int, targetRate int) []flo
 func buildAudioUserText(transcript string) string {
 	return strings.TrimSpace(
 		"The following text is an automatic speech transcription from the user. " +
-			"Respond to the user's meaning directly. Do not repeat the transcript back verbatim unless the user explicitly asked for transcription.\n\n" +
+			"Respond to the user's meaning directly. " +
+			"Keep the answer brief and easy to speak aloud, ideally one or two short sentences unless the user asks for more detail. " +
+			"Do not repeat the transcript back verbatim unless the user explicitly asked for transcription.\n\n" +
 			"User speech transcript:\n" + strings.TrimSpace(transcript),
 	)
 }
@@ -1308,15 +1605,17 @@ func loadCfg() cfg {
 
 	vadSpeechThreshold := parseEnvFloat("SILERO_VAD_SPEECH_THRESHOLD", 0.5)
 	vadNoiseThreshold := parseEnvFloat("SILERO_VAD_NOISE_THRESHOLD", maxFloat64(vadSpeechThreshold-0.15, 0.01))
-	vadMinSilenceMs := parseEnvInt("SILERO_VAD_MIN_SILENCE_MS", 100)
-	vadSpeechPadMs := parseEnvInt("SILERO_VAD_SPEECH_PAD_MS", 30)
+	vadMinSilenceMs := parseEnvInt("SILERO_VAD_MIN_SILENCE_MS", 350)
+	vadSpeechPadMs := parseEnvInt("SILERO_VAD_SPEECH_PAD_MS", 120)
+	vadMinSpeechMs := parseEnvInt("SILERO_VAD_MIN_SPEECH_MS", 300)
 
 	log.Printf(
-		"silero config speech_threshold=%.2f noise_threshold=%.2f min_silence_ms=%d speech_pad_ms=%d sample_rate=%d",
+		"silero config speech_threshold=%.2f noise_threshold=%.2f min_silence_ms=%d speech_pad_ms=%d min_speech_ms=%d sample_rate=%d",
 		vadSpeechThreshold,
 		vadNoiseThreshold,
 		vadMinSilenceMs,
 		vadSpeechPadMs,
+		vadMinSpeechMs,
 		targetVADSampleRate,
 	)
 
@@ -1348,6 +1647,9 @@ func loadCfg() cfg {
 	if sttLanguage == "" {
 		sttLanguage = strings.TrimSpace(os.Getenv("AGENT_STT_LANGUAGE"))
 	}
+	if sttLanguage == "" {
+		sttLanguage = defaultSttLanguage
+	}
 
 	ttsBaseURL := strings.TrimSpace(os.Getenv("PION_TTS_BASE_URL"))
 	if ttsBaseURL == "" {
@@ -1377,10 +1679,40 @@ func loadCfg() cfg {
 	if ttsVoice == "" {
 		ttsVoice = strings.TrimSpace(os.Getenv("AGENT_TTS_VOICE"))
 	}
+	if ttsVoice == "" {
+		ttsVoice = defaultVoiceForTTSModel(ttsModel)
+	}
 
 	ttsLanguage := strings.TrimSpace(os.Getenv("PION_TTS_LANGUAGE"))
 	if ttsLanguage == "" {
 		ttsLanguage = strings.TrimSpace(os.Getenv("AGENT_TTS_LANGUAGE"))
+	}
+	if ttsLanguage == "" {
+		ttsLanguage = defaultLanguageForTTSModel(ttsModel)
+	}
+
+	ttsMaxChars := parseEnvInt("PION_TTS_MAX_CHARS", 160)
+	if ttsMaxChars == 160 {
+		if raw := strings.TrimSpace(os.Getenv("AGENT_TTS_MAX_CHARS")); raw != "" {
+			ttsMaxChars = parseOptionalInt("AGENT_TTS_MAX_CHARS", raw)
+		}
+	}
+
+	warmupEnabled := parseEnvBool("PION_WARMUP_ENABLED", true)
+	if raw := strings.TrimSpace(os.Getenv("AGENT_WARMUP_ENABLED")); raw != "" {
+		warmupEnabled = parseOptionalBool("AGENT_WARMUP_ENABLED", raw)
+	}
+
+	warmupText := strings.TrimSpace(os.Getenv("PION_WARMUP_TEXT"))
+	if warmupText == "" {
+		warmupText = strings.TrimSpace(os.Getenv("AGENT_WARMUP_TEXT"))
+	}
+	if warmupText == "" {
+		if ttsLanguage == "ru" || sttLanguage == "ru" {
+			warmupText = "Привет."
+		} else {
+			warmupText = "Hello."
+		}
 	}
 
 	return cfg{
@@ -1397,12 +1729,16 @@ func loadCfg() cfg {
 		ttsAPIKey:          ttsAPIKey,
 		ttsVoice:           ttsVoice,
 		ttsLanguage:        ttsLanguage,
+		ttsMaxChars:        ttsMaxChars,
+		warmupEnabled:      warmupEnabled,
+		warmupText:         warmupText,
 		onnxRuntimeLibPath: onnxRuntimeLibPath,
 		sileroModelPath:    sileroModelPath,
 		vadSpeechThreshold: vadSpeechThreshold,
 		vadNoiseThreshold:  vadNoiseThreshold,
 		vadMinSilenceMs:    vadMinSilenceMs,
 		vadSpeechPadMs:     vadSpeechPadMs,
+		vadMinSpeechMs:     vadMinSpeechMs,
 	}
 }
 
@@ -1416,6 +1752,58 @@ func parseEnvInt(name string, fallback int) int {
 		log.Fatalf("invalid %s: %q", name, raw)
 	}
 	return parsed
+}
+
+func parseOptionalInt(name string, raw string) int {
+	parsed, err := strconv.Atoi(raw)
+	if err != nil {
+		log.Fatalf("invalid %s: %q", name, raw)
+	}
+	return parsed
+}
+
+func parseEnvBool(name string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	return parseOptionalBool(name, raw)
+}
+
+func parseOptionalBool(name string, raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		log.Fatalf("invalid %s: %q", name, raw)
+		return false
+	}
+}
+
+func defaultVoiceForTTSModel(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(lower, "kitten-tts"):
+		return "expr-voice-5-m"
+	case strings.Contains(lower, "qwen3-tts"):
+		return "Ryan"
+	default:
+		return defaultTtsVoice
+	}
+}
+
+func defaultLanguageForTTSModel(model string) string {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.Contains(lower, "kitten-tts"):
+		return "en"
+	case strings.Contains(lower, "qwen3-tts"):
+		return "ru"
+	default:
+		return defaultTtsLanguage
+	}
 }
 
 func maxFloat64(a, b float64) float64 {
@@ -1480,4 +1868,55 @@ func resolveTTSLanguage(configured string, text string) string {
 		}
 	}
 	return "en"
+}
+
+func shortenForSpeech(text string, maxChars int) string {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" || maxChars <= 0 || len(trimmed) <= maxChars {
+		return trimmed
+	}
+
+	for _, sep := range []string{". ", "! ", "? ", "\n"} {
+		if idx := strings.Index(trimmed, sep); idx >= 0 {
+			candidate := strings.TrimSpace(trimmed[:idx+1])
+			if candidate != "" && len(candidate) <= maxChars {
+				return candidate
+			}
+		}
+	}
+
+	limit := maxChars
+	for limit > 0 && trimmed[limit-1] != ' ' {
+		limit--
+	}
+	if limit < maxChars/2 {
+		limit = maxChars
+	}
+	return strings.TrimSpace(trimmed[:limit])
+}
+
+func warmupSpeechStack(sttClient *http.Client, ttsStreamer *ttsStreamer, config cfg) {
+	if err := warmupSTT(sttClient, config); err != nil {
+		log.Printf("stt warmup error: %v", err)
+	}
+	if ttsStreamer != nil {
+		if err := ttsStreamer.Speak(config.warmupText); err != nil {
+			log.Printf("tts warmup error: %v", err)
+		}
+	}
+}
+
+func warmupSTT(client *http.Client, config cfg) error {
+	silence := make([]float32, targetVADSampleRate/5)
+	wavBytes, err := encodePCM16WAV(silence, targetVADSampleRate)
+	if err != nil {
+		return err
+	}
+	startedAt := time.Now()
+	_, err = transcribeSpeechSegment(client, config, wavBytes)
+	if err != nil {
+		return err
+	}
+	log.Printf("[timing] stage=go_audio_stt_warmup ms=%d", time.Since(startedAt).Milliseconds())
+	return nil
 }
