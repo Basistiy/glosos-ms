@@ -114,6 +114,12 @@ type speechResponseRequest struct {
 	ResponseFormat string `json:"response_format"`
 }
 
+type dataChannelMessage struct {
+	Role string `json:"role"`
+	Text string `json:"text"`
+	Type string `json:"type,omitempty"`
+}
+
 type pendingCandidate struct {
 	Candidate        string
 	SDPMid           *string
@@ -390,6 +396,14 @@ func (p *speechPipeline) processSegment(samples []float32) {
 		return
 	}
 	log.Printf("[stt] transcript=%q", transcript)
+	dc := p.getDC()
+	if dc == nil {
+		log.Printf("transcript send skipped: data channel not ready")
+	} else {
+		if err := sendRoleMessage(dc, "user", transcript, "transcription"); err != nil {
+			log.Printf("transcript send error: %v", err)
+		}
+	}
 
 	chatStartedAt := time.Now()
 	reply, err := runAgentChat(p.agentClient, p.bridgeURL, buildAudioUserText(transcript))
@@ -402,12 +416,11 @@ func (p *speechPipeline) processSegment(samples []float32) {
 	if strings.TrimSpace(reply) == "" {
 		return
 	}
-	dc := p.getDC()
 	if dc == nil {
 		log.Printf("agent send skipped: data channel not ready")
 		return
 	}
-	if err := dc.SendText(reply); err != nil {
+	if err := sendRoleMessage(dc, "agent", reply, "message"); err != nil {
 		log.Printf("agent send error: %v", err)
 		return
 	}
@@ -812,7 +825,10 @@ func wireDC(client *http.Client, config cfg, dc *webrtc.DataChannel) {
 		log.Printf("data channel open: %s", dc.Label())
 	})
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		userText := string(msg.Data)
+		userText := parseIncomingText(msg.Data)
+		if userText == "" {
+			return
+		}
 		log.Printf("recv: %s", userText)
 
 		go func() {
@@ -825,7 +841,7 @@ func wireDC(client *http.Client, config cfg, dc *webrtc.DataChannel) {
 			if strings.TrimSpace(reply) == "" {
 				return
 			}
-			if sendErr := dc.SendText(reply); sendErr != nil {
+			if sendErr := sendRoleMessage(dc, "agent", reply, "message"); sendErr != nil {
 				log.Printf("agent send error: %v", sendErr)
 				return
 			}
@@ -836,6 +852,44 @@ func wireDC(client *http.Client, config cfg, dc *webrtc.DataChannel) {
 	dc.OnClose(func() {
 		log.Printf("data channel closed")
 	})
+}
+
+func parseIncomingText(payload []byte) string {
+	raw := strings.TrimSpace(string(payload))
+	if raw == "" {
+		return ""
+	}
+	if !strings.HasPrefix(raw, "{") {
+		return raw
+	}
+
+	var incoming struct {
+		Text    string `json:"text"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(raw), &incoming); err != nil {
+		return raw
+	}
+	if text := strings.TrimSpace(incoming.Text); text != "" {
+		return text
+	}
+	return strings.TrimSpace(incoming.Message)
+}
+
+func sendRoleMessage(dc *webrtc.DataChannel, role, text, messageType string) error {
+	payload := dataChannelMessage{
+		Role: strings.TrimSpace(role),
+		Text: strings.TrimSpace(text),
+		Type: strings.TrimSpace(messageType),
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal data channel payload: %w", err)
+	}
+	if err := dc.SendText(string(body)); err != nil {
+		return err
+	}
+	return nil
 }
 
 func newTTSStreamer(client *http.Client, config cfg, track *webrtc.TrackLocalStaticSample) (*ttsStreamer, error) {
