@@ -844,11 +844,28 @@ function handleAgentStdout(chunk) {
     }
 
     const pending = agentState.pending.get(requestID);
-    agentState.pending.delete(requestID);
     if (payload.error) {
+      agentState.pending.delete(requestID);
       pending.reject(new Error(payload.error));
       continue;
     }
+
+    if (pending.stream) {
+      if (typeof pending.onEvent === "function") {
+        try {
+          pending.onEvent(payload);
+        } catch (err) {
+          console.error("[bridge] agent stream event handler error", err);
+        }
+      }
+      if (payload.done) {
+        agentState.pending.delete(requestID);
+        pending.resolve(payload);
+      }
+      continue;
+    }
+
+    agentState.pending.delete(requestID);
     pending.resolve(payload);
   }
 }
@@ -910,16 +927,36 @@ async function chatWithAgent(message, { reset = false } = {}) {
   return String(response?.response ?? "");
 }
 
-async function sendAgentRequest(request) {
+async function streamChatWithAgent(message, { reset = false, onDelta } = {}) {
+  if (!message.trim()) {
+    throw new Error("message is required");
+  }
+  const response = await sendAgentRequest(
+    { type: "chat", message, reset, stream: true },
+    {
+      onEvent: (event) => {
+        const delta = typeof event?.delta === "string" ? event.delta : "";
+        if (!delta || typeof onDelta !== "function") {
+          return;
+        }
+        onDelta(delta);
+      }
+    }
+  );
+  return String(response?.response ?? "");
+}
+
+async function sendAgentRequest(request, { onEvent } = {}) {
   if (!agentState.process || !agentState.process.stdin || agentState.process.killed) {
     throw new Error("agent process is not running");
   }
 
   const id = `req-${agentState.nextRequestID++}`;
   const payload = JSON.stringify({ id, ...request });
+  const stream = Boolean(request?.stream);
 
   return new Promise((resolve, reject) => {
-    agentState.pending.set(id, { resolve, reject });
+    agentState.pending.set(id, { resolve, reject, stream, onEvent });
     agentState.process.stdin.write(`${payload}\n`, (err) => {
       if (!err) {
         return;
@@ -1011,6 +1048,35 @@ app.post("/agent/chat", asyncHandler(async (req, res) => {
   const response = await chatWithAgent(message, { reset });
   return res.json({ response });
 }));
+
+app.post("/agent/chat-stream", async (req, res, next) => {
+  const message = String(req.body?.message || "").trim();
+  const reset = Boolean(req.body?.reset);
+  if (!message) {
+    return res.status(400).json({ error: "message is required" });
+  }
+
+  res.setHeader("Content-Type", "application/x-ndjson; charset=utf-8");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  try {
+    const response = await streamChatWithAgent(message, {
+      reset,
+      onDelta: (delta) => {
+        res.write(`${JSON.stringify({ delta })}\n`);
+      }
+    });
+    res.write(`${JSON.stringify({ done: true, response })}\n`);
+    return res.end();
+  } catch (err) {
+    if (!res.headersSent) {
+      return next(err);
+    }
+    res.write(`${JSON.stringify({ done: true, error: err?.message || String(err) })}\n`);
+    return res.end();
+  }
+});
 
 app.post("/session/start", asyncHandler(async (req, res) => {
   const callId = String(req.body?.callId || "").trim();

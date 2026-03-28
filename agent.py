@@ -59,6 +59,43 @@ def complete_chat(client: OpenAI, model: str, messages: list[dict[str, Any]]) ->
     return extract_text(choice.message)
 
 
+def extract_delta_text(delta: Any) -> str:
+    content = getattr(delta, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                continue
+            text = getattr(item, "text", None)
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def stream_chat(
+    client: OpenAI,
+    model: str,
+    messages: list[dict[str, Any]],
+):
+    response_stream = client.chat.completions.create(model=model, messages=messages, stream=True)
+    for event in response_stream:
+        if not event.choices:
+            continue
+        delta = event.choices[0].delta
+        text = extract_delta_text(delta)
+        if text:
+            yield text
+
+
 def run_turn(
     client: OpenAI,
     model: str,
@@ -69,6 +106,22 @@ def run_turn(
     assistant_text = complete_chat(client, model, messages)
     messages.append({"role": "assistant", "content": assistant_text})
     return assistant_text
+
+
+def run_turn_stream(
+    client: OpenAI,
+    model: str,
+    messages: list[dict[str, Any]],
+    user_text: str,
+):
+    messages.append({"role": "user", "content": user_text})
+    full_parts: list[str] = []
+    for delta in stream_chat(client, model, messages):
+        full_parts.append(delta)
+        yield delta, None
+    assistant_text = "".join(full_parts).strip()
+    messages.append({"role": "assistant", "content": assistant_text})
+    yield None, assistant_text
 
 
 def run_stdio(args: argparse.Namespace) -> int:
@@ -93,9 +146,19 @@ def run_stdio(args: argparse.Namespace) -> int:
             message = str(payload.get("message", "")).strip()
             if not message:
                 raise ValueError("message is required")
+            stream = bool(payload.get("stream"))
 
-            response_text = run_turn(client, args.model, messages, message)
-            response = {"id": request_id, "response": response_text}
+            if stream:
+                response = None
+                for delta, maybe_final in run_turn_stream(client, args.model, messages, message):
+                    if delta is not None:
+                        sys.stdout.write(json.dumps({"id": request_id, "delta": delta, "done": False}) + "\n")
+                        sys.stdout.flush()
+                        continue
+                    response = {"id": request_id, "response": maybe_final or "", "done": True}
+            else:
+                response_text = run_turn(client, args.model, messages, message)
+                response = {"id": request_id, "response": response_text}
         except Exception as exc:  # noqa: BLE001
             response = {"id": request_id, "error": str(exc)}
 

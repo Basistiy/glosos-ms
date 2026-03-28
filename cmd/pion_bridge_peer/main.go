@@ -103,6 +103,13 @@ type agentChatResponse struct {
 	Response string `json:"response"`
 }
 
+type agentChatStreamEvent struct {
+	Delta    string `json:"delta"`
+	Response string `json:"response"`
+	Done     bool   `json:"done"`
+	Error    string `json:"error"`
+}
+
 type transcriptionResponse struct {
 	Text string `json:"text"`
 }
@@ -406,7 +413,48 @@ func (p *speechPipeline) processSegment(samples []float32) {
 	}
 
 	chatStartedAt := time.Now()
-	reply, err := runAgentChat(p.agentClient, p.bridgeURL, buildAudioUserText(transcript))
+	var pendingSpeech string
+	var speechQueue chan string
+	if p.ttsStreamer != nil {
+		speechQueue = make(chan string, 16)
+		go func() {
+			for chunk := range speechQueue {
+				if err := p.ttsStreamer.Speak(chunk); err != nil {
+					log.Printf("tts speak error: %v", err)
+				}
+			}
+		}()
+	}
+
+	reply, err := runAgentChatStream(
+		p.agentClient,
+		p.bridgeURL,
+		buildAudioUserText(transcript),
+		func(delta string) {
+			trimmed := strings.TrimSpace(delta)
+			if trimmed == "" {
+				return
+			}
+			if dc != nil {
+				if sendErr := sendRoleMessage(dc, "agent", delta, "message_chunk"); sendErr != nil {
+					log.Printf("agent chunk send error: %v", sendErr)
+				}
+			}
+			if speechQueue == nil {
+				return
+			}
+			pendingSpeech += delta
+			for _, chunk := range drainSpeechChunks(&pendingSpeech, false) {
+				speechQueue <- chunk
+			}
+		},
+	)
+	if speechQueue != nil {
+		for _, chunk := range drainSpeechChunks(&pendingSpeech, true) {
+			speechQueue <- chunk
+		}
+		close(speechQueue)
+	}
 	if err != nil {
 		log.Printf("agent request error: %v", err)
 		return
@@ -426,13 +474,6 @@ func (p *speechPipeline) processSegment(samples []float32) {
 	}
 	log.Printf("sent agent response")
 	log.Printf("[timing] stage=go_audio_turn total_ms=%d", time.Since(turnStartedAt).Milliseconds())
-	if p.ttsStreamer != nil {
-		go func(reply string) {
-			if err := p.ttsStreamer.Speak(reply); err != nil {
-				log.Printf("tts speak error: %v", err)
-			}
-		}(reply)
-	}
 }
 
 func forwardTrack(pipeline *speechPipeline, track *webrtc.TrackRemote) {
@@ -833,7 +874,14 @@ func wireDC(client *http.Client, config cfg, dc *webrtc.DataChannel) {
 
 		go func() {
 			startedAt := time.Now()
-			reply, err := runAgentChat(client, config.bridgeURL, userText)
+			reply, err := runAgentChatStream(client, config.bridgeURL, userText, func(delta string) {
+				if strings.TrimSpace(delta) == "" {
+					return
+				}
+				if sendErr := sendRoleMessage(dc, "agent", delta, "message_chunk"); sendErr != nil {
+					log.Printf("agent chunk send error: %v", sendErr)
+				}
+			})
 			if err != nil {
 				log.Printf("agent request error: %v", err)
 				return
@@ -890,6 +938,52 @@ func sendRoleMessage(dc *webrtc.DataChannel, role, text, messageType string) err
 		return err
 	}
 	return nil
+}
+
+func drainSpeechChunks(pending *string, flush bool) []string {
+	text := *pending
+	if text == "" {
+		return nil
+	}
+
+	chunks := make([]string, 0, 4)
+	for {
+		segmentEnd := strings.IndexAny(text, ".!?\n")
+		if segmentEnd >= 0 {
+			cut := segmentEnd + 1
+			chunk := strings.TrimSpace(text[:cut])
+			if chunk != "" {
+				chunks = append(chunks, chunk)
+			}
+			text = strings.TrimLeft(text[cut:], " \t\r\n")
+			continue
+		}
+
+		if len(text) >= 120 {
+			cut := strings.LastIndex(text[:120], " ")
+			if cut < 40 {
+				cut = 120
+			}
+			chunk := strings.TrimSpace(text[:cut])
+			if chunk != "" {
+				chunks = append(chunks, chunk)
+			}
+			text = strings.TrimLeft(text[cut:], " \t\r\n")
+			continue
+		}
+		break
+	}
+
+	if flush {
+		chunk := strings.TrimSpace(text)
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		text = ""
+	}
+
+	*pending = text
+	return chunks
 }
 
 func newTTSStreamer(client *http.Client, config cfg, track *webrtc.TrackLocalStaticSample) (*ttsStreamer, error) {
@@ -1101,6 +1195,75 @@ func runAgentChat(client *http.Client, bridgeURL string, message string) (string
 		return "", err
 	}
 	return resp.Response, nil
+}
+
+func runAgentChatStream(
+	client *http.Client,
+	bridgeURL string,
+	message string,
+	onDelta func(string),
+) (string, error) {
+	payload, err := json.Marshal(map[string]any{
+		"message": message,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, bridgeURL+"/agent/chat-stream", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(raw)))
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+	var full strings.Builder
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+
+		var event agentChatStreamEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			return "", fmt.Errorf("decode stream event: %w", err)
+		}
+
+		if event.Error != "" {
+			return "", fmt.Errorf("agent stream error: %s", event.Error)
+		}
+		if event.Delta != "" {
+			full.WriteString(event.Delta)
+			if onDelta != nil {
+				onDelta(event.Delta)
+			}
+		}
+		if event.Done {
+			final := strings.TrimSpace(event.Response)
+			if final != "" {
+				return final, nil
+			}
+			return strings.TrimSpace(full.String()), nil
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(full.String()), nil
 }
 
 func openSpeechStream(ctx context.Context, client *http.Client, cfg cfg, text string) (*wavStream, error) {
