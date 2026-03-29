@@ -219,7 +219,7 @@ func (p *speechPipeline) processSegment(samples []float32) {
 	reply, err := runAgentChatStream(
 		p.agentClient,
 		p.bridgeURL,
-		buildAudioUserText(transcript),
+		transcript,
 		func(delta string) {
 			trimmed := strings.TrimSpace(delta)
 			if trimmed == "" {
@@ -290,16 +290,6 @@ func forwardTrack(pipeline *speechPipeline, track *webrtc.TrackRemote) {
 			return
 		}
 	}
-}
-
-func buildAudioUserText(transcript string) string {
-	return strings.TrimSpace(
-		"The following text is an automatic speech transcription from the user. " +
-			"Respond to the user's meaning directly. " +
-			"Keep the answer brief and easy to speak aloud, ideally one or two short sentences unless the user asks for more detail. " +
-			"Do not repeat the transcript back verbatim unless the user explicitly asked for transcription.\n\n" +
-			"User speech transcript:\n" + strings.TrimSpace(transcript),
-	)
 }
 
 func warmupSpeechStack(sttClient *http.Client, ttsStreamer *ttsStreamer, config cfg) {
