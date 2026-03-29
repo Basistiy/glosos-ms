@@ -15,32 +15,24 @@ import (
 )
 
 func loadCfg() cfg {
-	var role, bridgeURL, peerID string
-	flag.StringVar(&role, "role", "callee", "Role: caller or callee")
+	var bridgeURL, peerID string
 	flag.StringVar(&bridgeURL, "bridge-url", "http://127.0.0.1:8080", "Bridge base URL")
 	flag.StringVar(&peerID, "peer-id", "", "Optional peer identifier for TURN username")
 	flag.Parse()
 
-	role = strings.TrimSpace(role)
 	bridgeURL = strings.TrimRight(strings.TrimSpace(bridgeURL), "/")
 
 	if override := strings.TrimSpace(os.Getenv("BRIDGE_URL")); override != "" {
 		bridgeURL = strings.TrimRight(override, "/")
 	}
-	if overrideRole := strings.TrimSpace(os.Getenv("PEER_ROLE")); overrideRole != "" {
-		role = overrideRole
-	}
 	if overridePeerID := strings.TrimSpace(os.Getenv("PEER_ID")); overridePeerID != "" {
 		peerID = overridePeerID
-	}
-	if role != "caller" && role != "callee" {
-		log.Fatal("-role must be caller or callee")
 	}
 	if bridgeURL == "" {
 		log.Fatal("-bridge-url is required")
 	}
 	if peerID == "" {
-		peerID = fmt.Sprintf("%s-%d", role, time.Now().Unix())
+		peerID = fmt.Sprintf("callee-%d", time.Now().Unix())
 	}
 
 	callID := uuid.NewString()
@@ -189,7 +181,6 @@ func loadCfg() cfg {
 	return cfg{
 		bridgeURL:          bridgeURL,
 		callID:             callID,
-		role:               role,
 		peerID:             peerID,
 		sttBaseURL:         sttBaseURL,
 		sttModel:           sttModel,

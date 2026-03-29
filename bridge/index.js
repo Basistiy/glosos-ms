@@ -81,7 +81,6 @@ const config = {
   turnTTLSeconds: intEnv("TURN_TTL_SECONDS", 86400),
   turnRefreshIntervalSeconds: intEnv("TURN_REFRESH_INTERVAL_SECONDS", 82800),
   autoStartPionPeer: (process.env.AUTO_START_PION_PEER || "1").trim() !== "0",
-  pionPeerRole: (process.env.PION_PEER_ROLE || "callee").trim(),
   pionPeerRestartDelayMs: intEnv("PION_PEER_RESTART_DELAY_MS", 3000),
   autoStartAgent: (process.env.AUTO_START_AGENT || "1").trim() !== "0",
   agentRunnerCommand: (process.env.AGENT_RUNNER_COMMAND || "uv").trim(),
@@ -559,9 +558,6 @@ function startPionPeer(bridgeURL) {
   if (!config.autoStartPionPeer) {
     return;
   }
-  if (config.pionPeerRole !== "caller" && config.pionPeerRole !== "callee") {
-    throw new Error("PION_PEER_ROLE must be caller or callee");
-  }
   if (peerState.process) {
     return;
   }
@@ -571,8 +567,6 @@ function startPionPeer(bridgeURL) {
     "-tags",
     "nolibopusfile",
     "./cmd/pion_bridge_peer",
-    "-role",
-    config.pionPeerRole,
     "-bridge-url",
     bridgeURL
   ];
@@ -583,7 +577,7 @@ function startPionPeer(bridgeURL) {
   });
 
   peerState.process = child;
-  console.log(`[bridge] started pion peer role=${config.pionPeerRole}`);
+  console.log("[bridge] started pion peer");
   prefixStream(child.stdout, "[pion]");
   prefixStream(child.stderr, "[pion]");
 

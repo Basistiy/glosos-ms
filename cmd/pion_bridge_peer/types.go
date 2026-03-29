@@ -32,7 +32,6 @@ const (
 type cfg struct {
 	bridgeURL          string
 	callID             string
-	role               string
 	peerID             string
 	sttBaseURL         string
 	sttModel           string

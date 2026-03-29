@@ -79,33 +79,25 @@ func pollRemoteDescription(
 		}
 
 		version = resp.Version
-		if config.role == "callee" {
-			if err := pc.SetRemoteDescription(*resp.Description); err != nil {
-				return fmt.Errorf("set remote offer: %w", err)
-			}
-			remoteGate.markReadyAndFlush(pc)
-			answer, ansErr := pc.CreateAnswer(nil)
-			if ansErr != nil {
-				return fmt.Errorf("create answer: %w", ansErr)
-			}
-			if ansErr = pc.SetLocalDescription(answer); ansErr != nil {
-				return fmt.Errorf("set local answer: %w", ansErr)
-			}
-			if ansErr = postJSON(client, fmt.Sprintf("%s/session/%s/local-description", config.bridgeURL, config.callID), map[string]any{
-				"type": answer.Type.String(),
-				"sdp":  answer.SDP,
-			}, nil); ansErr != nil {
-				return fmt.Errorf("post local answer: %w", ansErr)
-			}
-			enableCandidatePublishing()
-			log.Printf("answer posted to bridge")
-		} else {
-			if err := pc.SetRemoteDescription(*resp.Description); err != nil {
-				return fmt.Errorf("set remote answer: %w", err)
-			}
-			remoteGate.markReadyAndFlush(pc)
-			log.Printf("remote answer applied")
+		if err := pc.SetRemoteDescription(*resp.Description); err != nil {
+			return fmt.Errorf("set remote offer: %w", err)
 		}
+		remoteGate.markReadyAndFlush(pc)
+		answer, ansErr := pc.CreateAnswer(nil)
+		if ansErr != nil {
+			return fmt.Errorf("create answer: %w", ansErr)
+		}
+		if ansErr = pc.SetLocalDescription(answer); ansErr != nil {
+			return fmt.Errorf("set local answer: %w", ansErr)
+		}
+		if ansErr = postJSON(client, fmt.Sprintf("%s/session/%s/local-description", config.bridgeURL, config.callID), map[string]any{
+			"type": answer.Type.String(),
+			"sdp":  answer.SDP,
+		}, nil); ansErr != nil {
+			return fmt.Errorf("post local answer: %w", ansErr)
+		}
+		enableCandidatePublishing()
+		log.Printf("answer posted to bridge")
 		remoteSet = true
 	}
 	return nil

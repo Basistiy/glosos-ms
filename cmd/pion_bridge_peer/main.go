@@ -75,7 +75,7 @@ func main() {
 
 	if err := postJSON(client, config.bridgeURL+"/session/start", map[string]any{
 		"callId": config.callID,
-		"role":   config.role,
+		"role":   "callee",
 	}, nil); err != nil {
 		log.Fatalf("start session: %v", err)
 	}
@@ -231,31 +231,6 @@ func main() {
 			sendLocalCandidate(item)
 		}
 	})
-
-	if config.role == "caller" {
-		dc, dcErr := pc.CreateDataChannel("demo", nil)
-		if dcErr != nil {
-			log.Fatalf("create data channel: %v", dcErr)
-		}
-		setCurrentDC(dc)
-		wireDC(agentClient, config, dc)
-
-		offer, offerErr := pc.CreateOffer(nil)
-		if offerErr != nil {
-			log.Fatalf("create offer: %v", offerErr)
-		}
-		if offerErr = pc.SetLocalDescription(offer); offerErr != nil {
-			log.Fatalf("set local offer: %v", offerErr)
-		}
-		if err = postJSON(client, fmt.Sprintf("%s/session/%s/local-description", config.bridgeURL, config.callID), map[string]any{
-			"type": offer.Type.String(),
-			"sdp":  offer.SDP,
-		}, nil); err != nil {
-			log.Fatalf("post local offer: %v", err)
-		}
-		enableCandidatePublishing()
-		log.Printf("offer posted to bridge")
-	}
 
 	remoteGate := newRemoteCandidateGate()
 	go pollRemoteCandidates(ctx, client, config, pc, remoteGate)
