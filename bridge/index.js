@@ -74,6 +74,13 @@ const config = {
   mlxAudioHost: (process.env.MLX_AUDIO_HOST || "127.0.0.1").trim(),
   mlxAudioPort: intEnv("MLX_AUDIO_PORT", 8001),
   mlxAudioRestartDelayMs: intEnv("MLX_AUDIO_RESTART_DELAY_MS", 3000),
+  autoStartSayTTSServer: (process.env.AUTO_START_SAY_TTS_SERVER || "0").trim() !== "0",
+  sayTtsRunnerCommand: (process.env.SAY_TTS_RUNNER_COMMAND || "uv").trim(),
+  sayTtsHost: (process.env.SAY_TTS_HOST || "127.0.0.1").trim(),
+  sayTtsPort: intEnv("SAY_TTS_PORT", 8112),
+  sayTtsRestartDelayMs: intEnv("SAY_TTS_RESTART_DELAY_MS", 3000),
+  sayTtsScriptPath: (process.env.SAY_TTS_SCRIPT_PATH || path.join(repoRoot, "services", "say_tts_server.py")).trim(),
+  autoConfigurePionTtsBaseUrl: (process.env.AUTO_CONFIGURE_PION_TTS_BASE_URL || "1").trim() !== "0",
   turnFunctionRegion: (process.env.TURN_FUNCTION_REGION || "europe-west1").trim(),
   turnFunctionName: (process.env.TURN_FUNCTION_NAME || "getTurnCredentials").trim(),
   turnServer: (process.env.TURN_SERVER || "54.37.235.123:3478").trim(),
@@ -120,6 +127,12 @@ const mlxState = {
 };
 
 const mlxAudioState = {
+  process: null,
+  restartTimer: null,
+  shuttingDown: false
+};
+
+const sayTtsState = {
   process: null,
   restartTimer: null,
   shuttingDown: false
@@ -330,6 +343,10 @@ function mlxAudioApiBase() {
   return `http://${config.mlxAudioHost}:${config.mlxAudioPort}/v1`;
 }
 
+function sayTtsApiBase() {
+  return `http://${config.sayTtsHost}:${config.sayTtsPort}/v1`;
+}
+
 function clearMlxRestartTimer() {
   if (mlxState.restartTimer) {
     clearTimeout(mlxState.restartTimer);
@@ -341,6 +358,13 @@ function clearMlxAudioRestartTimer() {
   if (mlxAudioState.restartTimer) {
     clearTimeout(mlxAudioState.restartTimer);
     mlxAudioState.restartTimer = null;
+  }
+}
+
+function clearSayTtsRestartTimer() {
+  if (sayTtsState.restartTimer) {
+    clearTimeout(sayTtsState.restartTimer);
+    sayTtsState.restartTimer = null;
   }
 }
 
@@ -428,6 +452,43 @@ function ensureMlxAudioRuntimeReady() {
   }
 }
 
+function ensureSayTtsRuntimeReady() {
+  const runnerCheck = spawnSync(config.sayTtsRunnerCommand, ["--version"], {
+    cwd: repoRoot,
+    env: process.env,
+    encoding: "utf8"
+  });
+  if (runnerCheck.error) {
+    throw new Error(
+      `say-tts runner '${config.sayTtsRunnerCommand}' is not available: ${runnerCheck.error.message}`
+    );
+  }
+  if (runnerCheck.status !== 0) {
+    throw new Error(
+      `say-tts runner '${config.sayTtsRunnerCommand}' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
+    );
+  }
+
+  const importCheck = spawnSync(
+    config.sayTtsRunnerCommand,
+    ["run", "python", "-c", "import fastapi, uvicorn"],
+    {
+      cwd: repoRoot,
+      env: process.env,
+      encoding: "utf8"
+    }
+  );
+  if (importCheck.error) {
+    throw new Error(`say-tts dependency check failed: ${importCheck.error.message}`);
+  }
+  if (importCheck.status !== 0) {
+    throw new Error(
+      `Missing Python dependencies for say-tts server. Run 'uv sync' in ${repoRoot}. ` +
+      `Details: ${importCheck.stderr || importCheck.stdout}`
+    );
+  }
+}
+
 function scheduleMlxRestart() {
   if (mlxState.shuttingDown || !config.autoStartMlxServer) {
     return;
@@ -446,6 +507,16 @@ function scheduleMlxAudioRestart() {
   mlxAudioState.restartTimer = setTimeout(() => {
     startMlxAudioServer();
   }, Math.max(1000, config.mlxAudioRestartDelayMs));
+}
+
+function scheduleSayTtsRestart() {
+  if (sayTtsState.shuttingDown || !config.autoStartSayTTSServer) {
+    return;
+  }
+  clearSayTtsRestartTimer();
+  sayTtsState.restartTimer = setTimeout(() => {
+    startSayTtsServer();
+  }, Math.max(1000, config.sayTtsRestartDelayMs));
 }
 
 function startMlxServer() {
@@ -528,6 +599,44 @@ function startMlxAudioServer() {
   });
 }
 
+function startSayTtsServer() {
+  if (!config.autoStartSayTTSServer || sayTtsState.process) {
+    return;
+  }
+
+  ensureSayTtsRuntimeReady();
+
+  const args = [
+    "run",
+    "python",
+    config.sayTtsScriptPath,
+    "--host",
+    config.sayTtsHost,
+    "--port",
+    String(config.sayTtsPort)
+  ];
+  const child = spawn(config.sayTtsRunnerCommand, args, {
+    cwd: repoRoot,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  sayTtsState.process = child;
+  console.log(`[bridge] started say-tts server base=${sayTtsApiBase()}`);
+  prefixStream(child.stdout, "[say-tts]");
+  prefixStream(child.stderr, "[say-tts]");
+
+  child.on("error", (err) => {
+    console.error("[bridge] failed to start say-tts server", err);
+  });
+
+  child.on("exit", (code, signal) => {
+    sayTtsState.process = null;
+    console.log(`[bridge] say-tts server exited code=${code ?? "null"} signal=${signal ?? "null"}`);
+    scheduleSayTtsRestart();
+  });
+}
+
 function stopMlxServer() {
   mlxState.shuttingDown = true;
   clearMlxRestartTimer();
@@ -541,6 +650,14 @@ function stopMlxAudioServer() {
   clearMlxAudioRestartTimer();
   if (mlxAudioState.process) {
     mlxAudioState.process.kill("SIGTERM");
+  }
+}
+
+function stopSayTtsServer() {
+  sayTtsState.shuttingDown = true;
+  clearSayTtsRestartTimer();
+  if (sayTtsState.process) {
+    sayTtsState.process.kill("SIGTERM");
   }
 }
 
@@ -570,9 +687,19 @@ function startPionPeer(bridgeURL) {
     "-bridge-url",
     bridgeURL
   ];
+  const childEnv = { ...process.env };
+  if (config.autoStartSayTTSServer && config.autoConfigurePionTtsBaseUrl) {
+    const ttsBaseURL = `http://${config.sayTtsHost}:${config.sayTtsPort}`;
+    if (!childEnv.PION_TTS_BASE_URL || !childEnv.PION_TTS_BASE_URL.trim()) {
+      childEnv.PION_TTS_BASE_URL = ttsBaseURL;
+    }
+    if (!childEnv.AGENT_TTS_BASE_URL || !childEnv.AGENT_TTS_BASE_URL.trim()) {
+      childEnv.AGENT_TTS_BASE_URL = ttsBaseURL;
+    }
+  }
   const child = spawn("go", args, {
     cwd: repoRoot,
-    env: process.env,
+    env: childEnv,
     stdio: ["ignore", "pipe", "pipe"]
   });
 
@@ -1228,6 +1355,7 @@ async function boot() {
   scheduleFirebaseRestart();
   startMlxServer();
   startMlxAudioServer();
+  startSayTtsServer();
   startAgentProcess();
   app.listen(config.port, () => {
     const bridgeURL = `http://127.0.0.1:${config.port}`;
@@ -1275,6 +1403,7 @@ process.on("SIGINT", () => {
   stopAgentProcess();
   stopMlxServer();
   stopMlxAudioServer();
+  stopSayTtsServer();
   shutdownPeer();
   process.exit(0);
 });
@@ -1285,6 +1414,7 @@ process.on("SIGTERM", () => {
   stopAgentProcess();
   stopMlxServer();
   stopMlxAudioServer();
+  stopSayTtsServer();
   shutdownPeer();
   process.exit(0);
 });
