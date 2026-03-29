@@ -73,7 +73,7 @@ experiments/
 
 # Local Go build artifacts
 .gocache/
-pion_bridge_peer
+/pion_bridge_peer
 
 # Local media output
 recordings/
