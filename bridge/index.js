@@ -96,7 +96,7 @@ const config = {
   agentSttApiKey: (process.env.AGENT_STT_API_KEY || "mlx-audio").trim(),
   agentSttModel: (process.env.AGENT_STT_MODEL || "mlx-community/Qwen3-ASR-0.6B-4bit").trim(),
   agentSttLanguage: (process.env.AGENT_STT_LANGUAGE || "en").trim(),
-  agentTtsModel: (process.env.AGENT_TTS_MODEL || "say-tts").trim(),
+  agentTtsModel: (process.env.AGENT_TTS_MODEL || "mlx-community/kitten-tts-mini-0.8-8bit").trim(),
   googleSttProjectId: (process.env.GOOGLE_STT_PROJECT_ID || "").trim(),
   googleSttLocation: (process.env.GOOGLE_STT_LOCATION || "global").trim(),
   googleSttRecognizer: (process.env.GOOGLE_STT_RECOGNIZER || "_").trim(),
@@ -675,7 +675,9 @@ function startPionPeer(bridgeURL) {
     bridgeURL
   ];
   const childEnv = { ...process.env };
-  if (config.autoStartSayTTSServer && config.autoConfigurePionTtsBaseUrl) {
+  const selectedPionTtsModel = (childEnv.PION_TTS_MODEL || childEnv.AGENT_TTS_MODEL || config.agentTtsModel || "").trim().toLowerCase();
+  const useSayTts = selectedPionTtsModel === "say-tts";
+  if (config.autoStartSayTTSServer && config.autoConfigurePionTtsBaseUrl && useSayTts) {
     const ttsBaseURL = `http://${config.sayTtsHost}:${config.sayTtsPort}`;
     if (!childEnv.PION_TTS_BASE_URL || !childEnv.PION_TTS_BASE_URL.trim()) {
       childEnv.PION_TTS_BASE_URL = ttsBaseURL;
