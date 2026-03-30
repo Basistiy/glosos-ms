@@ -91,6 +91,9 @@ const config = {
   pionPeerRestartDelayMs: intEnv("PION_PEER_RESTART_DELAY_MS", 3000),
   autoStartAgent: (process.env.AUTO_START_AGENT || "1").trim() !== "0",
   agentRunnerCommand: (process.env.AGENT_RUNNER_COMMAND || "uv").trim(),
+  agentApiBase: (process.env.AGENT_API_BASE || "").trim(),
+  agentApiKey: (process.env.AGENT_API_KEY || "mlx-local").trim(),
+  agentModel: (process.env.AGENT_MODEL || "").trim(),
   agentSttProvider: (process.env.AGENT_STT_PROVIDER || "mlx_audio").trim(),
   agentSttBaseUrl: (process.env.AGENT_STT_BASE_URL || "").trim(),
   agentSttApiKey: (process.env.AGENT_STT_API_KEY || "mlx-audio").trim(),
@@ -987,14 +990,18 @@ function startAgentProcess() {
 
   ensureAgentRuntimeReady();
 
+  const agentApiBase = config.agentApiBase || mlxApiBase();
+  const agentModel = config.agentModel || config.mlxModel;
   const args = [
     "run",
     "agent.py",
     "--stdio",
     "--api-base",
-    mlxApiBase(),
+    agentApiBase,
+    "--api-key",
+    config.agentApiKey,
     "--model",
-    config.mlxModel
+    agentModel
   ];
   const child = spawn(config.agentRunnerCommand, args, {
     cwd: repoRoot,

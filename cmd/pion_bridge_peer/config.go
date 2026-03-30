@@ -157,6 +157,7 @@ func loadCfg() cfg {
 			ttsMaxChars = parseOptionalInt("AGENT_TTS_MAX_CHARS", raw)
 		}
 	}
+	ttsDebugDumpDir := strings.TrimSpace(os.Getenv("PION_TTS_DEBUG_DUMP_DIR"))
 
 	warmupEnabled := parseEnvBool("PION_WARMUP_ENABLED", true)
 	if raw := strings.TrimSpace(os.Getenv("AGENT_WARMUP_ENABLED")); raw != "" {
@@ -189,6 +190,7 @@ func loadCfg() cfg {
 		ttsVoice:           ttsVoice,
 		ttsLanguage:        ttsLanguage,
 		ttsMaxChars:        ttsMaxChars,
+		ttsDebugDumpDir:    ttsDebugDumpDir,
 		warmupEnabled:      warmupEnabled,
 		warmupText:         warmupText,
 		onnxRuntimeLibPath: onnxRuntimeLibPath,

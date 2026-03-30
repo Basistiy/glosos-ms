@@ -9,6 +9,8 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode"
@@ -74,15 +76,20 @@ func (s *ttsStreamer) Speak(text string) error {
 		s.frameWriter = frameWriter
 	}
 	firstChunkLogged := false
+	pcmInputSamples := 0
+	resampledSamples := 0
+	startFrames := frameWriter.frames
 	for {
 		if !s.isCurrent(generation) {
 			return nil
 		}
 		pcm, readErr := stream.ReadPCM16Chunk(4096)
 		if len(pcm) > 0 {
+			pcmInputSamples += len(pcm)
 			mono := pcm16ToFloat32Mono(pcm, stream.channels)
 			resampled := resampleMonoFloat32(mono, stream.sampleRate, targetTTSSampleRate)
 			if len(resampled) > 0 {
+				resampledSamples += len(resampled)
 				if !firstChunkLogged {
 					log.Printf(
 						"[timing] stage=go_audio_tts_first_audio text_chars=%d spoken_chars=%d first_audio_ms=%d",
@@ -114,11 +121,26 @@ func (s *ttsStreamer) Speak(text string) error {
 	if err := frameWriter.Flush(generation, s.isCurrent); err != nil {
 		return err
 	}
+	writtenFrames := frameWriter.frames - startFrames
+	expectedMs := int64(0)
+	if resampledSamples > 0 {
+		expectedMs = int64((resampledSamples * 1000) / targetTTSSampleRate)
+	}
+	sentMs := int64(writtenFrames) * int64(ttsFrameDuration/time.Millisecond)
 	log.Printf(
 		"[timing] stage=go_audio_tts text_chars=%d spoken_chars=%d tts_ms=%d",
 		len(trimmed),
 		len(spokenText),
 		time.Since(startedAt).Milliseconds(),
+	)
+	log.Printf(
+		"[timing] stage=go_audio_tts_transport text_chars=%d pcm_in_samples=%d resampled_samples=%d sent_frames=%d expected_ms=%d sent_ms=%d",
+		len(spokenText),
+		pcmInputSamples,
+		resampledSamples,
+		writtenFrames,
+		expectedMs,
+		sentMs,
 	)
 	return nil
 }
@@ -199,7 +221,6 @@ func (w *opusFrameWriter) Flush(generation uint64, isCurrent func(uint64) bool) 
 	for i := len(w.pending); i < frameSize; i++ {
 		frame[i] = 0
 	}
-	applyFadeOut(frame, targetTTSSampleRate/500) // 2ms fade: preserve word endings while reducing boundary clicks.
 	w.pending = nil
 	return w.writeFrame(frame)
 }
@@ -245,6 +266,7 @@ func (w *opusFrameWriter) writeFrame(frame []float32) error {
 	}); err != nil {
 		return fmt.Errorf("write opus sample: %w", err)
 	}
+	w.frames++
 	w.nextAt = w.nextAt.Add(ttsFrameDuration)
 	return nil
 }
@@ -277,7 +299,7 @@ func openSpeechStream(ctx context.Context, client *http.Client, cfg cfg, text st
 		requestBody.Voice = cfg.ttsVoice
 	}
 
-	body, err := json.Marshal(requestBody)
+	reqBody, err := json.Marshal(requestBody)
 	if err != nil {
 		return nil, err
 	}
@@ -285,7 +307,7 @@ func openSpeechStream(ctx context.Context, client *http.Client, cfg cfg, text st
 		ctx,
 		http.MethodPost,
 		normalizeOpenAIBaseURL(cfg.ttsBaseURL)+"/audio/speech",
-		bytes.NewReader(body),
+		bytes.NewReader(reqBody),
 	)
 	if err != nil {
 		return nil, err
@@ -312,12 +334,63 @@ func openSpeechStream(ctx context.Context, client *http.Client, cfg cfg, text st
 		resp.Body.Close()
 		return nil, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(raw)))
 	}
-	stream, err := newWAVStream(resp.Body)
+
+	body := resp.Body
+	if dumpDir := strings.TrimSpace(cfg.ttsDebugDumpDir); dumpDir != "" {
+		if err := os.MkdirAll(dumpDir, 0o755); err != nil {
+			log.Printf("tts debug dump mkdir error: %v", err)
+		} else {
+			fileName := fmt.Sprintf("tts-%d-%d.wav", time.Now().UnixNano(), len(text))
+			wavPath := filepath.Join(dumpDir, fileName)
+			file, err := os.Create(wavPath)
+			if err != nil {
+				log.Printf("tts debug dump create error: %v", err)
+			} else {
+				textPath := strings.TrimSuffix(wavPath, ".wav") + ".txt"
+				if writeErr := os.WriteFile(textPath, []byte(text), 0o644); writeErr != nil {
+					log.Printf("tts debug dump text write error: %v", writeErr)
+				}
+				log.Printf("[timing] stage=go_audio_tts_debug_dump path=%s text_chars=%d", wavPath, len(text))
+				body = &teeReadCloser{
+					reader: io.TeeReader(resp.Body, file),
+					src:    resp.Body,
+					file:   file,
+				}
+			}
+		}
+	}
+
+	stream, err := newWAVStream(body)
 	if err != nil {
-		resp.Body.Close()
+		body.Close()
 		return nil, err
 	}
 	return stream, nil
+}
+
+type teeReadCloser struct {
+	reader io.Reader
+	src    io.Closer
+	file   *os.File
+}
+
+func (t *teeReadCloser) Read(p []byte) (int, error) {
+	return t.reader.Read(p)
+}
+
+func (t *teeReadCloser) Close() error {
+	var firstErr error
+	if t.file != nil {
+		if err := t.file.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	if t.src != nil {
+		if err := t.src.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 func transcribeSpeechSegment(client *http.Client, cfg cfg, wavBytes []byte) (string, error) {

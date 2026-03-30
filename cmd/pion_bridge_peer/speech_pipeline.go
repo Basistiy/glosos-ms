@@ -120,14 +120,18 @@ func (p *speechPipeline) WritePayload(payload []byte) error {
 }
 
 func (p *speechPipeline) onSpeechSegment(start, end silerovad.SampleOffset) {
-	p.bufferMu.Lock()
-	defer p.bufferMu.Unlock()
-
 	if start != silerovad.InvalidSampleOffset {
 		p.cancelActiveTurn()
 		if p.ttsStreamer != nil {
 			p.ttsStreamer.Interrupt()
 		}
+		log.Printf("[timing] stage=go_audio_interrupt reason=vad_start")
+	}
+
+	p.bufferMu.Lock()
+	defer p.bufferMu.Unlock()
+
+	if start != silerovad.InvalidSampleOffset {
 		p.segmentStart = int(start)
 	}
 
@@ -213,11 +217,14 @@ func (p *speechPipeline) processSegment(samples []float32) {
 	chatStartedAt := time.Now()
 	var pendingSpeech string
 	var speechQueue chan string
+	var speechDone chan struct{}
 	ttsQueuedChars := 0
 	ttsQueuedChunks := 0
 	if p.ttsStreamer != nil {
 		speechQueue = make(chan string, 16)
+		speechDone = make(chan struct{})
 		go func() {
+			defer close(speechDone)
 			for {
 				select {
 				case <-turnCtx.Done():
@@ -325,6 +332,9 @@ func (p *speechPipeline) processSegment(samples []float32) {
 	}
 	log.Printf("sent agent response")
 	log.Printf("[timing] stage=go_audio_turn total_ms=%d", time.Since(turnStartedAt).Milliseconds())
+	if speechDone != nil {
+		<-speechDone
+	}
 }
 
 func (p *speechPipeline) setActiveTurnCancel(cancel context.CancelFunc) uint64 {

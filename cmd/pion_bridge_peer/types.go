@@ -43,6 +43,7 @@ type cfg struct {
 	ttsVoice           string
 	ttsLanguage        string
 	ttsMaxChars        int
+	ttsDebugDumpDir    string
 	warmupEnabled      bool
 	warmupText         string
 	onnxRuntimeLibPath string
@@ -171,4 +172,5 @@ type opusFrameWriter struct {
 	encoder *opus.Encoder
 	pending []float32
 	nextAt  time.Time
+	frames  uint64
 }
