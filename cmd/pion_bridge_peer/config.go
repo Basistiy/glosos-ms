@@ -140,9 +140,6 @@ func loadCfg() cfg {
 
 	ttsVoice := strings.TrimSpace(os.Getenv("PION_TTS_VOICE"))
 	if ttsVoice == "" {
-		ttsVoice = strings.TrimSpace(os.Getenv("AGENT_TTS_VOICE"))
-	}
-	if ttsVoice == "" {
 		ttsVoice = defaultVoiceForTTSModel(ttsModel)
 	}
 
