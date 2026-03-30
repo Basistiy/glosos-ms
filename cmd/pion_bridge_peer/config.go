@@ -154,8 +154,8 @@ func loadCfg() cfg {
 		ttsLanguage = defaultLanguageForTTSModel(ttsModel)
 	}
 
-	ttsMaxChars := parseEnvInt("PION_TTS_MAX_CHARS", 160)
-	if ttsMaxChars == 160 {
+	ttsMaxChars := parseEnvInt("PION_TTS_MAX_CHARS", 0)
+	if ttsMaxChars == 0 {
 		if raw := strings.TrimSpace(os.Getenv("AGENT_TTS_MAX_CHARS")); raw != "" {
 			ttsMaxChars = parseOptionalInt("AGENT_TTS_MAX_CHARS", raw)
 		}
@@ -323,21 +323,27 @@ func shortenForSpeech(text string, maxChars int) string {
 	if trimmed == "" || maxChars <= 0 || len(trimmed) <= maxChars {
 		return trimmed
 	}
+	minPreferred := (maxChars * 7) / 10
+	if minPreferred < 1 {
+		minPreferred = 1
+	}
 
-	for _, sep := range []string{". ", "! ", "? ", "\n"} {
-		if idx := strings.Index(trimmed, sep); idx >= 0 {
-			candidate := strings.TrimSpace(trimmed[:idx+1])
-			if candidate != "" && len(candidate) <= maxChars {
-				return candidate
-			}
+	bestPunct := -1
+	for i := 0; i < len(trimmed) && i < maxChars; i++ {
+		switch trimmed[i] {
+		case '.', '!', '?', '\n':
+			bestPunct = i
 		}
+	}
+	if bestPunct >= minPreferred {
+		return strings.TrimSpace(trimmed[:bestPunct+1])
 	}
 
 	limit := maxChars
 	for limit > 0 && trimmed[limit-1] != ' ' {
 		limit--
 	}
-	if limit < maxChars/2 {
+	if limit < minPreferred {
 		limit = maxChars
 	}
 	return strings.TrimSpace(trimmed[:limit])

@@ -21,7 +21,7 @@ const (
 	defaultTtsModel     = "say-tts"
 	defaultSttLanguage  = "en"
 	defaultTtsLanguage  = "en"
-	defaultTtsVoice     = "expr-voice-5-m"
+	defaultTtsVoice     = "Ava (Premium)"
 	targetTTSSampleRate = 48000
 	targetTTSChannels   = 2
 	targetVADSampleRate = 16000
