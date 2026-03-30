@@ -198,7 +198,6 @@ func (p *speechPipeline) processSegment(samples []float32) {
 	log.Printf("[stt] transcript=%q", transcript)
 
 	turnCtx, turnCancel := context.WithCancel(context.Background())
-	defer turnCancel()
 	turnID := p.setActiveTurnCancel(turnCancel)
 	defer p.clearActiveTurnCancel(turnID)
 
@@ -214,6 +213,8 @@ func (p *speechPipeline) processSegment(samples []float32) {
 	chatStartedAt := time.Now()
 	var pendingSpeech string
 	var speechQueue chan string
+	ttsQueuedChars := 0
+	ttsQueuedChunks := 0
 	if p.ttsStreamer != nil {
 		speechQueue = make(chan string, 16)
 		go func() {
@@ -259,6 +260,8 @@ func (p *speechPipeline) processSegment(samples []float32) {
 			}
 			pendingSpeech += delta
 			for _, chunk := range drainSpeechChunks(&pendingSpeech, false) {
+				ttsQueuedChars += len(chunk)
+				ttsQueuedChunks++
 				select {
 				case <-turnCtx.Done():
 					return
@@ -271,6 +274,8 @@ func (p *speechPipeline) processSegment(samples []float32) {
 		if turnCtx.Err() == nil {
 		drainLoop:
 			for _, chunk := range drainSpeechChunks(&pendingSpeech, true) {
+				ttsQueuedChars += len(chunk)
+				ttsQueuedChunks++
 				select {
 				case <-turnCtx.Done():
 					break drainLoop
@@ -292,7 +297,20 @@ func (p *speechPipeline) processSegment(samples []float32) {
 		log.Printf("[timing] stage=go_audio_turn_interrupted total_ms=%d", time.Since(turnStartedAt).Milliseconds())
 		return
 	}
-	log.Printf("[timing] stage=go_audio_llm transcript_chars=%d llm_ms=%d", len(transcript), time.Since(chatStartedAt).Milliseconds())
+	if speechQueue != nil {
+		log.Printf(
+			"[timing] stage=go_audio_tts_queue llm_chars=%d tts_queued_chars=%d tts_queued_chunks=%d",
+			len(reply),
+			ttsQueuedChars,
+			ttsQueuedChunks,
+		)
+	}
+	log.Printf(
+		"[timing] stage=go_audio_llm transcript_chars=%d llm_chars=%d llm_ms=%d",
+		len(transcript),
+		len(reply),
+		time.Since(chatStartedAt).Milliseconds(),
+	)
 
 	if strings.TrimSpace(reply) == "" {
 		return

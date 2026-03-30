@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
@@ -34,6 +35,9 @@ func newTTSStreamer(client *http.Client, config cfg, track *webrtc.TrackLocalSta
 func (s *ttsStreamer) Speak(text string) error {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
+		return nil
+	}
+	if !hasSpeakableContent(trimmed) {
 		return nil
 	}
 	spokenText := shortenForSpeech(trimmed, s.config.ttsMaxChars)
@@ -119,6 +123,15 @@ func (s *ttsStreamer) Speak(text string) error {
 	return nil
 }
 
+func hasSpeakableContent(text string) bool {
+	for _, r := range text {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *ttsStreamer) Interrupt() {
 	s.generation.Add(1)
 	s.interrupted.Store(true)
@@ -183,11 +196,10 @@ func (w *opusFrameWriter) Flush(generation uint64, isCurrent func(uint64) bool) 
 	frameSize := targetTTSSampleRate / 50
 	frame := make([]float32, frameSize)
 	copy(frame, w.pending)
-	last := w.pending[len(w.pending)-1]
 	for i := len(w.pending); i < frameSize; i++ {
-		frame[i] = last
+		frame[i] = 0
 	}
-	applyFadeOut(frame, targetTTSSampleRate/200) // 5ms fade to reduce tail clicks at chunk boundaries.
+	applyFadeOut(frame, targetTTSSampleRate/500) // 2ms fade: preserve word endings while reducing boundary clicks.
 	w.pending = nil
 	return w.writeFrame(frame)
 }

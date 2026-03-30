@@ -48,7 +48,11 @@ func wireDC(client *http.Client, config cfg, dc *webrtc.DataChannel) {
 				return
 			}
 			log.Printf("sent agent response")
-			log.Printf("[timing] stage=go_text_turn total_ms=%d", time.Since(startedAt).Milliseconds())
+			log.Printf(
+				"[timing] stage=go_text_turn llm_chars=%d total_ms=%d",
+				len(reply),
+				time.Since(startedAt).Milliseconds(),
+			)
 		}()
 	})
 	dc.OnClose(func() {
@@ -96,10 +100,10 @@ func sendRoleMessage(dc *webrtc.DataChannel, role, text, messageType string) err
 
 func drainSpeechChunks(pending *string, flush bool) []string {
 	const (
-		speechChunkMinPunctuation = 90
-		speechChunkSoftLimit      = 220
-		speechChunkHardLimit      = 320
-		speechChunkMinSpaceCut    = 100
+		speechChunkMinImmediate = 32
+		speechChunkSoftLimit    = 180
+		speechChunkHardLimit    = 260
+		speechChunkMinSpaceCut  = 80
 	)
 
 	text := *pending
@@ -110,11 +114,25 @@ func drainSpeechChunks(pending *string, flush bool) []string {
 	chunks := make([]string, 0, 4)
 	for {
 		segmentEnd := strings.IndexAny(text, ".!?\n")
-		if segmentEnd >= 0 && (segmentEnd+1) >= speechChunkMinPunctuation {
+		if segmentEnd >= 0 {
 			cut := segmentEnd + 1
-			chunk := strings.TrimSpace(text[:cut])
-			if chunk != "" {
-				chunks = append(chunks, chunk)
+			candidate := strings.TrimSpace(text[:cut])
+			if !flush && len(candidate) > 0 && len(candidate) < speechChunkMinImmediate {
+				for len(candidate) < speechChunkMinImmediate {
+					rest := text[cut:]
+					next := strings.IndexAny(rest, ".!?\n")
+					if next < 0 {
+						break
+					}
+					cut += next + 1
+					candidate = strings.TrimSpace(text[:cut])
+				}
+				if len(candidate) < speechChunkMinImmediate {
+					break
+				}
+			}
+			if candidate != "" {
+				chunks = append(chunks, candidate)
 			}
 			text = strings.TrimLeft(text[cut:], " \t\r\n")
 			continue
@@ -224,6 +242,14 @@ func runAgentChatStreamWithContext(
 		if event.Done {
 			final := strings.TrimSpace(event.Response)
 			if final != "" {
+				accumulated := full.String()
+				if strings.HasPrefix(final, accumulated) && len(final) > len(accumulated) {
+					missing := final[len(accumulated):]
+					full.WriteString(missing)
+					if onDelta != nil {
+						onDelta(missing)
+					}
+				}
 				return final, nil
 			}
 			return strings.TrimSpace(full.String()), nil
