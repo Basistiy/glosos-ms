@@ -245,27 +245,13 @@ func parseOptionalBool(name string, raw string) bool {
 }
 
 func defaultVoiceForTTSModel(model string) string {
-	lower := strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case strings.Contains(lower, "kitten-tts"):
-		return "expr-voice-5-m"
-	case strings.Contains(lower, "qwen3-tts"):
-		return "Ryan"
-	default:
-		return defaultTtsVoice
-	}
+	_ = model
+	return defaultTtsVoice
 }
 
 func defaultLanguageForTTSModel(model string) string {
-	lower := strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case strings.Contains(lower, "kitten-tts"):
-		return "en"
-	case strings.Contains(lower, "qwen3-tts"):
-		return "ru"
-	default:
-		return defaultTtsLanguage
-	}
+	_ = model
+	return defaultTtsLanguage
 }
 
 func maxFloat64(a, b float64) float64 {

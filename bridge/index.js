@@ -96,7 +96,7 @@ const config = {
   agentSttApiKey: (process.env.AGENT_STT_API_KEY || "mlx-audio").trim(),
   agentSttModel: (process.env.AGENT_STT_MODEL || "mlx-community/Qwen3-ASR-0.6B-4bit").trim(),
   agentSttLanguage: (process.env.AGENT_STT_LANGUAGE || "en").trim(),
-  agentTtsModel: (process.env.AGENT_TTS_MODEL || "mlx-community/kitten-tts-mini-0.8-8bit").trim(),
+  agentTtsModel: (process.env.AGENT_TTS_MODEL || "say-tts").trim(),
   googleSttProjectId: (process.env.GOOGLE_STT_PROJECT_ID || "").trim(),
   googleSttLocation: (process.env.GOOGLE_STT_LOCATION || "global").trim(),
   googleSttRecognizer: (process.env.GOOGLE_STT_RECOGNIZER || "_").trim(),
@@ -437,19 +437,6 @@ function ensureMlxAudioRuntimeReady() {
     );
   }
 
-  const usesKittenTTS = config.agentTtsModel && config.agentTtsModel.toLowerCase().includes("kitten-tts");
-  if (usesKittenTTS) {
-    const espeakCheck = spawnSync("zsh", ["-lc", "command -v espeak-ng || command -v espeak"], {
-      cwd: repoRoot,
-      env: process.env,
-      encoding: "utf8"
-    });
-    if (espeakCheck.error || espeakCheck.status !== 0) {
-      throw new Error(
-        "KittenTTS requires espeak or espeak-ng to be installed and available on PATH."
-      );
-    }
-  }
 }
 
 function ensureSayTtsRuntimeReady() {

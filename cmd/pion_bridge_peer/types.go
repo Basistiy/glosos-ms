@@ -18,7 +18,7 @@ const (
 	defaultSttBaseURL   = "http://127.0.0.1:8001/v1"
 	defaultSttModel     = "mlx-community/Qwen3-ASR-0.6B-4bit"
 	defaultSttAPIKey    = "mlx-audio"
-	defaultTtsModel     = "mlx-community/kitten-tts-mini-0.8-8bit"
+	defaultTtsModel     = "say-tts"
 	defaultSttLanguage  = "en"
 	defaultTtsLanguage  = "en"
 	defaultTtsVoice     = "expr-voice-5-m"
