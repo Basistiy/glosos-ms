@@ -139,18 +139,22 @@ type speechPipeline struct {
 	bufferOffset int
 	segmentStart int
 	processMu    sync.Mutex
+	turnMu       sync.Mutex
+	activeTurn   context.CancelFunc
+	activeTurnID uint64
+	turnSeq      uint64
 }
 
 type ttsStreamer struct {
-	client     *http.Client
-	config     cfg
-	track      *webrtc.TrackLocalStaticSample
-	encoder    *opus.Encoder
+	client      *http.Client
+	config      cfg
+	track       *webrtc.TrackLocalStaticSample
+	encoder     *opus.Encoder
 	frameWriter *opusFrameWriter
-	mu         sync.Mutex
-	cancelMu   sync.Mutex
-	activeStop context.CancelFunc
-	generation atomic.Uint64
+	mu          sync.Mutex
+	cancelMu    sync.Mutex
+	activeStop  context.CancelFunc
+	generation  atomic.Uint64
 	interrupted atomic.Bool
 }
 

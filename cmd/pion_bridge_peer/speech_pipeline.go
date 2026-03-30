@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -122,6 +124,7 @@ func (p *speechPipeline) onSpeechSegment(start, end silerovad.SampleOffset) {
 	defer p.bufferMu.Unlock()
 
 	if start != silerovad.InvalidSampleOffset {
+		p.cancelActiveTurn()
 		if p.ttsStreamer != nil {
 			p.ttsStreamer.Interrupt()
 		}
@@ -193,6 +196,12 @@ func (p *speechPipeline) processSegment(samples []float32) {
 		return
 	}
 	log.Printf("[stt] transcript=%q", transcript)
+
+	turnCtx, turnCancel := context.WithCancel(context.Background())
+	defer turnCancel()
+	turnID := p.setActiveTurnCancel(turnCancel)
+	defer p.clearActiveTurnCancel(turnID)
+
 	dc := p.getDC()
 	if dc == nil {
 		log.Printf("transcript send skipped: data channel not ready")
@@ -208,19 +217,34 @@ func (p *speechPipeline) processSegment(samples []float32) {
 	if p.ttsStreamer != nil {
 		speechQueue = make(chan string, 16)
 		go func() {
-			for chunk := range speechQueue {
-				if err := p.ttsStreamer.Speak(chunk); err != nil {
-					log.Printf("tts speak error: %v", err)
+			for {
+				select {
+				case <-turnCtx.Done():
+					return
+				case chunk, ok := <-speechQueue:
+					if !ok {
+						return
+					}
+					if strings.TrimSpace(chunk) == "" {
+						continue
+					}
+					if err := p.ttsStreamer.Speak(chunk); err != nil {
+						log.Printf("tts speak error: %v", err)
+					}
 				}
 			}
 		}()
 	}
 
-	reply, err := runAgentChatStream(
+	reply, err := runAgentChatStreamWithContext(
+		turnCtx,
 		p.agentClient,
 		p.bridgeURL,
 		transcript,
 		func(delta string) {
+			if turnCtx.Err() != nil {
+				return
+			}
 			trimmed := strings.TrimSpace(delta)
 			if trimmed == "" {
 				return
@@ -235,18 +259,37 @@ func (p *speechPipeline) processSegment(samples []float32) {
 			}
 			pendingSpeech += delta
 			for _, chunk := range drainSpeechChunks(&pendingSpeech, false) {
-				speechQueue <- chunk
+				select {
+				case <-turnCtx.Done():
+					return
+				case speechQueue <- chunk:
+				}
 			}
 		},
 	)
 	if speechQueue != nil {
-		for _, chunk := range drainSpeechChunks(&pendingSpeech, true) {
-			speechQueue <- chunk
+		if turnCtx.Err() == nil {
+		drainLoop:
+			for _, chunk := range drainSpeechChunks(&pendingSpeech, true) {
+				select {
+				case <-turnCtx.Done():
+					break drainLoop
+				case speechQueue <- chunk:
+				}
+			}
 		}
 		close(speechQueue)
 	}
 	if err != nil {
+		if turnCtx.Err() != nil || errors.Is(err, context.Canceled) {
+			log.Printf("[timing] stage=go_audio_turn_interrupted total_ms=%d", time.Since(turnStartedAt).Milliseconds())
+			return
+		}
 		log.Printf("agent request error: %v", err)
+		return
+	}
+	if turnCtx.Err() != nil {
+		log.Printf("[timing] stage=go_audio_turn_interrupted total_ms=%d", time.Since(turnStartedAt).Milliseconds())
 		return
 	}
 	log.Printf("[timing] stage=go_audio_llm transcript_chars=%d llm_ms=%d", len(transcript), time.Since(chatStartedAt).Milliseconds())
@@ -264,6 +307,33 @@ func (p *speechPipeline) processSegment(samples []float32) {
 	}
 	log.Printf("sent agent response")
 	log.Printf("[timing] stage=go_audio_turn total_ms=%d", time.Since(turnStartedAt).Milliseconds())
+}
+
+func (p *speechPipeline) setActiveTurnCancel(cancel context.CancelFunc) uint64 {
+	p.turnMu.Lock()
+	defer p.turnMu.Unlock()
+	p.turnSeq++
+	p.activeTurnID = p.turnSeq
+	p.activeTurn = cancel
+	return p.activeTurnID
+}
+
+func (p *speechPipeline) clearActiveTurnCancel(turnID uint64) {
+	p.turnMu.Lock()
+	defer p.turnMu.Unlock()
+	if p.activeTurnID == turnID {
+		p.activeTurn = nil
+		p.activeTurnID = 0
+	}
+}
+
+func (p *speechPipeline) cancelActiveTurn() {
+	p.turnMu.Lock()
+	cancel := p.activeTurn
+	p.turnMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func forwardTrack(pipeline *speechPipeline, track *webrtc.TrackRemote) {

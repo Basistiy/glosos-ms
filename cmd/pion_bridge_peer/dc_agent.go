@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -162,6 +163,16 @@ func runAgentChatStream(
 	message string,
 	onDelta func(string),
 ) (string, error) {
+	return runAgentChatStreamWithContext(context.Background(), client, bridgeURL, message, onDelta)
+}
+
+func runAgentChatStreamWithContext(
+	ctx context.Context,
+	client *http.Client,
+	bridgeURL string,
+	message string,
+	onDelta func(string),
+) (string, error) {
 	payload, err := json.Marshal(map[string]any{
 		"message": message,
 	})
@@ -169,7 +180,7 @@ func runAgentChatStream(
 		return "", err
 	}
 
-	req, err := http.NewRequest(http.MethodPost, bridgeURL+"/agent/chat-stream", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, bridgeURL+"/agent/chat-stream", bytes.NewReader(payload))
 	if err != nil {
 		return "", err
 	}
