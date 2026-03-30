@@ -146,10 +146,12 @@ type ttsStreamer struct {
 	config     cfg
 	track      *webrtc.TrackLocalStaticSample
 	encoder    *opus.Encoder
+	frameWriter *opusFrameWriter
 	mu         sync.Mutex
 	cancelMu   sync.Mutex
 	activeStop context.CancelFunc
 	generation atomic.Uint64
+	interrupted atomic.Bool
 }
 
 type wavStream struct {

@@ -94,6 +94,13 @@ func sendRoleMessage(dc *webrtc.DataChannel, role, text, messageType string) err
 }
 
 func drainSpeechChunks(pending *string, flush bool) []string {
+	const (
+		speechChunkMinPunctuation = 90
+		speechChunkSoftLimit      = 220
+		speechChunkHardLimit      = 320
+		speechChunkMinSpaceCut    = 100
+	)
+
 	text := *pending
 	if text == "" {
 		return nil
@@ -102,7 +109,7 @@ func drainSpeechChunks(pending *string, flush bool) []string {
 	chunks := make([]string, 0, 4)
 	for {
 		segmentEnd := strings.IndexAny(text, ".!?\n")
-		if segmentEnd >= 0 {
+		if segmentEnd >= 0 && (segmentEnd+1) >= speechChunkMinPunctuation {
 			cut := segmentEnd + 1
 			chunk := strings.TrimSpace(text[:cut])
 			if chunk != "" {
@@ -112,10 +119,10 @@ func drainSpeechChunks(pending *string, flush bool) []string {
 			continue
 		}
 
-		if len(text) >= 120 {
-			cut := strings.LastIndex(text[:120], " ")
-			if cut < 40 {
-				cut = 120
+		if len(text) >= speechChunkHardLimit {
+			cut := strings.LastIndex(text[:speechChunkHardLimit], " ")
+			if cut < speechChunkMinSpaceCut {
+				cut = speechChunkSoftLimit
 			}
 			chunk := strings.TrimSpace(text[:cut])
 			if chunk != "" {

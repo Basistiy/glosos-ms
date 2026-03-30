@@ -23,10 +23,11 @@ func newTTSStreamer(client *http.Client, config cfg, track *webrtc.TrackLocalSta
 		return nil, fmt.Errorf("create opus encoder: %w", err)
 	}
 	return &ttsStreamer{
-		client:  client,
-		config:  config,
-		track:   track,
-		encoder: encoder,
+		client:      client,
+		config:      config,
+		track:       track,
+		encoder:     encoder,
+		frameWriter: newOpusFrameWriter(track, encoder),
 	}, nil
 }
 
@@ -46,6 +47,9 @@ func (s *ttsStreamer) Speak(text string) error {
 	if !s.isCurrent(generation) {
 		return nil
 	}
+	if s.interrupted.Swap(false) && s.frameWriter != nil {
+		s.frameWriter.Reset()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	s.setActiveCancel(cancel)
 	defer s.clearActiveCancel()
@@ -60,7 +64,11 @@ func (s *ttsStreamer) Speak(text string) error {
 	}
 	defer stream.Close()
 
-	frameWriter := newOpusFrameWriter(s.track, s.encoder)
+	frameWriter := s.frameWriter
+	if frameWriter == nil {
+		frameWriter = newOpusFrameWriter(s.track, s.encoder)
+		s.frameWriter = frameWriter
+	}
 	firstChunkLogged := false
 	for {
 		if !s.isCurrent(generation) {
@@ -113,6 +121,7 @@ func (s *ttsStreamer) Speak(text string) error {
 
 func (s *ttsStreamer) Interrupt() {
 	s.generation.Add(1)
+	s.interrupted.Store(true)
 	s.cancelMu.Lock()
 	cancel := s.activeStop
 	s.cancelMu.Unlock()
@@ -174,8 +183,18 @@ func (w *opusFrameWriter) Flush(generation uint64, isCurrent func(uint64) bool) 
 	frameSize := targetTTSSampleRate / 50
 	frame := make([]float32, frameSize)
 	copy(frame, w.pending)
+	last := w.pending[len(w.pending)-1]
+	for i := len(w.pending); i < frameSize; i++ {
+		frame[i] = last
+	}
+	applyFadeOut(frame, targetTTSSampleRate/200) // 5ms fade to reduce tail clicks at chunk boundaries.
 	w.pending = nil
 	return w.writeFrame(frame)
+}
+
+func (w *opusFrameWriter) Reset() {
+	w.pending = nil
+	w.nextAt = time.Time{}
 }
 
 func (w *opusFrameWriter) writeFrame(frame []float32) error {
@@ -216,6 +235,24 @@ func (w *opusFrameWriter) writeFrame(frame []float32) error {
 	}
 	w.nextAt = w.nextAt.Add(ttsFrameDuration)
 	return nil
+}
+
+func applyFadeOut(samples []float32, fadeSamples int) {
+	if len(samples) == 0 || fadeSamples <= 0 {
+		return
+	}
+	if fadeSamples > len(samples) {
+		fadeSamples = len(samples)
+	}
+	start := len(samples) - fadeSamples
+	denom := float32(fadeSamples)
+	for i := start; i < len(samples); i++ {
+		factor := float32(len(samples)-1-i) / denom
+		if factor < 0 {
+			factor = 0
+		}
+		samples[i] *= factor
+	}
 }
 
 func openSpeechStream(ctx context.Context, client *http.Client, cfg cfg, text string) (*wavStream, error) {
