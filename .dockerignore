@@ -1,0 +1,12 @@
+.git
+.gocache
+.uv-cache
+.venv
+__pycache__
+*.pyc
+bridge/node_modules
+functions/node_modules
+node_modules
+logs
+assets
+.DS_Store

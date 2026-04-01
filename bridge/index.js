@@ -1,6 +1,6 @@
 import "dotenv/config";
 import express from "express";
-import crypto from "crypto";
+import fs from "fs";
 import { spawn, spawnSync } from "child_process";
 import path from "path";
 import { createInterface } from "readline/promises";
@@ -26,14 +26,6 @@ import {
   updateDoc,
   deleteField
 } from "firebase/firestore";
-
-function mustEnv(name) {
-  const value = (process.env[name] || "").trim();
-  if (!value) {
-    throw new Error(`${name} is required`);
-  }
-  return value;
-}
 
 function intEnv(name, fallback) {
   const raw = (process.env[name] || "").trim();
@@ -63,48 +55,15 @@ const config = {
   autoRestartFirebase: (process.env.AUTO_RESTART_FIREBASE || "1").trim() !== "0",
   firebaseRestartIntervalMs: intEnv("FIREBASE_RESTART_INTERVAL_MS", 15 * 60 * 1000),
   port: intEnv("BRIDGE_PORT", 8080),
-  autoStartMlxServer: (process.env.AUTO_START_MLX_SERVER || "1").trim() !== "0",
-  mlxRunnerCommand: (process.env.MLX_RUNNER_COMMAND || "uv").trim(),
-  mlxModel: (process.env.MLX_MODEL || "mlx-community/Qwen3-4B-Instruct-2507-4bit").trim(),
-  mlxHost: (process.env.MLX_HOST || "127.0.0.1").trim(),
-  mlxPort: intEnv("MLX_PORT", 8000),
-  mlxRestartDelayMs: intEnv("MLX_RESTART_DELAY_MS", 3000),
-  autoStartMlxAudioServer: (process.env.AUTO_START_MLX_AUDIO_SERVER || "1").trim() !== "0",
-  mlxAudioRunnerCommand: (process.env.MLX_AUDIO_RUNNER_COMMAND || "uv").trim(),
-  mlxAudioHost: (process.env.MLX_AUDIO_HOST || "127.0.0.1").trim(),
-  mlxAudioPort: intEnv("MLX_AUDIO_PORT", 8001),
-  mlxAudioRestartDelayMs: intEnv("MLX_AUDIO_RESTART_DELAY_MS", 3000),
-  autoStartSayTTSServer: (process.env.AUTO_START_SAY_TTS_SERVER || "0").trim() !== "0",
-  sayTtsRunnerCommand: (process.env.SAY_TTS_RUNNER_COMMAND || "uv").trim(),
-  sayTtsHost: (process.env.SAY_TTS_HOST || "127.0.0.1").trim(),
-  sayTtsPort: intEnv("SAY_TTS_PORT", 8112),
-  sayTtsRestartDelayMs: intEnv("SAY_TTS_RESTART_DELAY_MS", 3000),
-  sayTtsScriptPath: (process.env.SAY_TTS_SCRIPT_PATH || path.join(repoRoot, "services", "say_tts_server.py")).trim(),
-  autoConfigurePionTtsBaseUrl: (process.env.AUTO_CONFIGURE_PION_TTS_BASE_URL || "1").trim() !== "0",
   turnFunctionRegion: (process.env.TURN_FUNCTION_REGION || "europe-west1").trim(),
   turnFunctionName: (process.env.TURN_FUNCTION_NAME || "getTurnCredentials").trim(),
   turnServer: (process.env.TURN_SERVER || "54.37.235.123:3478").trim(),
-  turnAuthSecret: (process.env.TURN_AUTH_SECRET || "").trim(),
   turnTTLSeconds: intEnv("TURN_TTL_SECONDS", 86400),
   turnRefreshIntervalSeconds: intEnv("TURN_REFRESH_INTERVAL_SECONDS", 82800),
   autoStartPionPeer: (process.env.AUTO_START_PION_PEER || "1").trim() !== "0",
+  pionPeerBinaryPath: (process.env.PION_PEER_BINARY_PATH || path.join(repoRoot, "bin", "pion_bridge_peer")).trim(),
   pionPeerRestartDelayMs: intEnv("PION_PEER_RESTART_DELAY_MS", 3000),
   autoStartAgent: (process.env.AUTO_START_AGENT || "1").trim() !== "0",
-  agentRunnerCommand: (process.env.AGENT_RUNNER_COMMAND || "uv").trim(),
-  agentApiBase: (process.env.AGENT_API_BASE || "").trim(),
-  agentApiKey: (process.env.AGENT_API_KEY || "mlx-local").trim(),
-  agentModel: (process.env.AGENT_MODEL || "").trim(),
-  agentSttProvider: (process.env.AGENT_STT_PROVIDER || "mlx_audio").trim(),
-  agentSttBaseUrl: (process.env.AGENT_STT_BASE_URL || "").trim(),
-  agentSttApiKey: (process.env.AGENT_STT_API_KEY || "mlx-audio").trim(),
-  agentSttModel: (process.env.AGENT_STT_MODEL || "mlx-community/Qwen3-ASR-0.6B-4bit").trim(),
-  agentSttLanguage: (process.env.AGENT_STT_LANGUAGE || "en").trim(),
-  agentTtsModel: (process.env.AGENT_TTS_MODEL || "mlx-community/kitten-tts-mini-0.8-8bit").trim(),
-  googleSttProjectId: (process.env.GOOGLE_STT_PROJECT_ID || "").trim(),
-  googleSttLocation: (process.env.GOOGLE_STT_LOCATION || "global").trim(),
-  googleSttRecognizer: (process.env.GOOGLE_STT_RECOGNIZER || "_").trim(),
-  googleSttModel: (process.env.GOOGLE_STT_MODEL || "").trim(),
-  agentDisableAudioTranscription: (process.env.AGENT_DISABLE_AUDIO_TRANSCRIPTION || "0").trim() === "1",
   agentRestartDelayMs: intEnv("AGENT_RESTART_DELAY_MS", 3000),
   agentRequiredImports: (process.env.AGENT_REQUIRED_IMPORTS || "openai").split(",")
     .map((item) => item.trim())
@@ -118,24 +77,6 @@ const turnState = {
 };
 
 const peerState = {
-  process: null,
-  restartTimer: null,
-  shuttingDown: false
-};
-
-const mlxState = {
-  process: null,
-  restartTimer: null,
-  shuttingDown: false
-};
-
-const mlxAudioState = {
-  process: null,
-  restartTimer: null,
-  shuttingDown: false
-};
-
-const sayTtsState = {
   process: null,
   restartTimer: null,
   shuttingDown: false
@@ -212,27 +153,6 @@ function timestampMillis(value) {
   if (value instanceof Date) return value.getTime();
   if (typeof value.seconds === "number") return (value.seconds * 1000);
   return 0;
-}
-
-function makeTurnCredentials({ peerId, ttlSeconds }) {
-  if (!config.turnAuthSecret) {
-    throw new Error("TURN_AUTH_SECRET is not configured");
-  }
-  const ttl = Math.max(60, Math.min(86400, Number.isFinite(ttlSeconds) ? ttlSeconds : config.turnTTLSeconds));
-  const expiry = Math.floor(Date.now() / 1000) + ttl;
-  const username = `${expiry}:${peerId}`;
-  const credential = crypto
-    .createHmac("sha1", config.turnAuthSecret)
-    .update(username)
-    .digest("base64");
-
-  return {
-    turnServer: config.turnServer,
-    username,
-    credential,
-    ttlSeconds: ttl,
-    expiresAtUnix: expiry
-  };
 }
 
 async function fetchTurnCredentialsFromFirebase(functions, { ttlSeconds }) {
@@ -338,319 +258,6 @@ function clearFirebaseRestartTimer() {
   }
 }
 
-function mlxApiBase() {
-  return `http://${config.mlxHost}:${config.mlxPort}/v1`;
-}
-
-function mlxAudioApiBase() {
-  return `http://${config.mlxAudioHost}:${config.mlxAudioPort}/v1`;
-}
-
-function sayTtsApiBase() {
-  return `http://${config.sayTtsHost}:${config.sayTtsPort}/v1`;
-}
-
-function clearMlxRestartTimer() {
-  if (mlxState.restartTimer) {
-    clearTimeout(mlxState.restartTimer);
-    mlxState.restartTimer = null;
-  }
-}
-
-function clearMlxAudioRestartTimer() {
-  if (mlxAudioState.restartTimer) {
-    clearTimeout(mlxAudioState.restartTimer);
-    mlxAudioState.restartTimer = null;
-  }
-}
-
-function clearSayTtsRestartTimer() {
-  if (sayTtsState.restartTimer) {
-    clearTimeout(sayTtsState.restartTimer);
-    sayTtsState.restartTimer = null;
-  }
-}
-
-function ensureMlxRuntimeReady() {
-  const runnerCheck = spawnSync(config.mlxRunnerCommand, ["--version"], {
-    cwd: repoRoot,
-    env: process.env,
-    encoding: "utf8"
-  });
-  if (runnerCheck.error) {
-    throw new Error(
-      `MLX runner '${config.mlxRunnerCommand}' is not available: ${runnerCheck.error.message}`
-    );
-  }
-  if (runnerCheck.status !== 0) {
-    throw new Error(
-      `MLX runner '${config.mlxRunnerCommand}' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
-    );
-  }
-
-  const importCheck = spawnSync(config.mlxRunnerCommand, ["run", "python", "-c", "import mlx_lm"], {
-    cwd: repoRoot,
-    env: process.env,
-    encoding: "utf8"
-  });
-  if (importCheck.error) {
-    throw new Error(`MLX dependency check failed: ${importCheck.error.message}`);
-  }
-  if (importCheck.status !== 0) {
-    throw new Error(
-      `Missing Python dependencies for MLX server. Run 'uv sync' in ${repoRoot}. ` +
-      `Details: ${importCheck.stderr || importCheck.stdout}`
-    );
-  }
-}
-
-function ensureMlxAudioRuntimeReady() {
-  const runnerCheck = spawnSync(config.mlxAudioRunnerCommand, ["--version"], {
-    cwd: repoRoot,
-    env: process.env,
-    encoding: "utf8"
-  });
-  if (runnerCheck.error) {
-    throw new Error(
-      `MLX audio runner '${config.mlxAudioRunnerCommand}' is not available: ${runnerCheck.error.message}`
-    );
-  }
-  if (runnerCheck.status !== 0) {
-    throw new Error(
-      `MLX audio runner '${config.mlxAudioRunnerCommand}' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
-    );
-  }
-
-  const importCheck = spawnSync(
-    config.mlxAudioRunnerCommand,
-    ["run", "python", "-c", "import mlx_audio, uvicorn, fastapi, webrtcvad, multipart, phonemizer"],
-    {
-      cwd: repoRoot,
-      env: process.env,
-      encoding: "utf8"
-    }
-  );
-  if (importCheck.error) {
-    throw new Error(`MLX audio dependency check failed: ${importCheck.error.message}`);
-  }
-  if (importCheck.status !== 0) {
-    throw new Error(
-      `Missing Python dependencies for MLX audio server. Run 'uv sync' in ${repoRoot}. ` +
-      `Details: ${importCheck.stderr || importCheck.stdout}`
-    );
-  }
-
-}
-
-function ensureSayTtsRuntimeReady() {
-  const runnerCheck = spawnSync(config.sayTtsRunnerCommand, ["--version"], {
-    cwd: repoRoot,
-    env: process.env,
-    encoding: "utf8"
-  });
-  if (runnerCheck.error) {
-    throw new Error(
-      `say-tts runner '${config.sayTtsRunnerCommand}' is not available: ${runnerCheck.error.message}`
-    );
-  }
-  if (runnerCheck.status !== 0) {
-    throw new Error(
-      `say-tts runner '${config.sayTtsRunnerCommand}' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
-    );
-  }
-
-  const importCheck = spawnSync(
-    config.sayTtsRunnerCommand,
-    ["run", "python", "-c", "import fastapi, uvicorn"],
-    {
-      cwd: repoRoot,
-      env: process.env,
-      encoding: "utf8"
-    }
-  );
-  if (importCheck.error) {
-    throw new Error(`say-tts dependency check failed: ${importCheck.error.message}`);
-  }
-  if (importCheck.status !== 0) {
-    throw new Error(
-      `Missing Python dependencies for say-tts server. Run 'uv sync' in ${repoRoot}. ` +
-      `Details: ${importCheck.stderr || importCheck.stdout}`
-    );
-  }
-}
-
-function scheduleMlxRestart() {
-  if (mlxState.shuttingDown || !config.autoStartMlxServer) {
-    return;
-  }
-  clearMlxRestartTimer();
-  mlxState.restartTimer = setTimeout(() => {
-    startMlxServer();
-  }, Math.max(1000, config.mlxRestartDelayMs));
-}
-
-function scheduleMlxAudioRestart() {
-  if (mlxAudioState.shuttingDown || !config.autoStartMlxAudioServer || config.agentSttProvider !== "mlx_audio") {
-    return;
-  }
-  clearMlxAudioRestartTimer();
-  mlxAudioState.restartTimer = setTimeout(() => {
-    startMlxAudioServer();
-  }, Math.max(1000, config.mlxAudioRestartDelayMs));
-}
-
-function scheduleSayTtsRestart() {
-  if (sayTtsState.shuttingDown || !config.autoStartSayTTSServer) {
-    return;
-  }
-  clearSayTtsRestartTimer();
-  sayTtsState.restartTimer = setTimeout(() => {
-    startSayTtsServer();
-  }, Math.max(1000, config.sayTtsRestartDelayMs));
-}
-
-function startMlxServer() {
-  if (!config.autoStartMlxServer || mlxState.process) {
-    return;
-  }
-
-  ensureMlxRuntimeReady();
-
-  const args = [
-    "run",
-    "python",
-    "-m",
-    "mlx_lm.server",
-    "--model",
-    config.mlxModel,
-    "--host",
-    config.mlxHost,
-    "--port",
-    String(config.mlxPort)
-  ];
-  const child = spawn(config.mlxRunnerCommand, args, {
-    cwd: repoRoot,
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-
-  mlxState.process = child;
-  console.log(`[bridge] started MLX server model=${config.mlxModel} base=${mlxApiBase()}`);
-  prefixStream(child.stdout, "[mlx]");
-  prefixStream(child.stderr, "[mlx]");
-
-  child.on("error", (err) => {
-    console.error("[bridge] failed to start MLX server", err);
-  });
-
-  child.on("exit", (code, signal) => {
-    mlxState.process = null;
-    console.log(`[bridge] MLX server exited code=${code ?? "null"} signal=${signal ?? "null"}`);
-    scheduleMlxRestart();
-  });
-}
-
-function startMlxAudioServer() {
-  if (!config.autoStartMlxAudioServer || config.agentSttProvider !== "mlx_audio" || mlxAudioState.process) {
-    return;
-  }
-
-  ensureMlxAudioRuntimeReady();
-
-  const args = [
-    "run",
-    "python",
-    "-m",
-    "mlx_audio.server",
-    "--host",
-    config.mlxAudioHost,
-    "--port",
-    String(config.mlxAudioPort)
-  ];
-  const child = spawn(config.mlxAudioRunnerCommand, args, {
-    cwd: repoRoot,
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-
-  mlxAudioState.process = child;
-  console.log(`[bridge] started MLX audio server base=${mlxAudioApiBase()}`);
-  prefixStream(child.stdout, "[mlx-audio]");
-  prefixStream(child.stderr, "[mlx-audio]");
-
-  child.on("error", (err) => {
-    console.error("[bridge] failed to start MLX audio server", err);
-  });
-
-  child.on("exit", (code, signal) => {
-    mlxAudioState.process = null;
-    console.log(`[bridge] MLX audio server exited code=${code ?? "null"} signal=${signal ?? "null"}`);
-    scheduleMlxAudioRestart();
-  });
-}
-
-function startSayTtsServer() {
-  if (!config.autoStartSayTTSServer || sayTtsState.process) {
-    return;
-  }
-
-  ensureSayTtsRuntimeReady();
-
-  const args = [
-    "run",
-    "python",
-    config.sayTtsScriptPath,
-    "--host",
-    config.sayTtsHost,
-    "--port",
-    String(config.sayTtsPort)
-  ];
-  const child = spawn(config.sayTtsRunnerCommand, args, {
-    cwd: repoRoot,
-    env: process.env,
-    stdio: ["ignore", "pipe", "pipe"]
-  });
-
-  sayTtsState.process = child;
-  console.log(`[bridge] started say-tts server base=${sayTtsApiBase()}`);
-  prefixStream(child.stdout, "[say-tts]");
-  prefixStream(child.stderr, "[say-tts]");
-
-  child.on("error", (err) => {
-    console.error("[bridge] failed to start say-tts server", err);
-  });
-
-  child.on("exit", (code, signal) => {
-    sayTtsState.process = null;
-    console.log(`[bridge] say-tts server exited code=${code ?? "null"} signal=${signal ?? "null"}`);
-    scheduleSayTtsRestart();
-  });
-}
-
-function stopMlxServer() {
-  mlxState.shuttingDown = true;
-  clearMlxRestartTimer();
-  if (mlxState.process) {
-    mlxState.process.kill("SIGTERM");
-  }
-}
-
-function stopMlxAudioServer() {
-  mlxAudioState.shuttingDown = true;
-  clearMlxAudioRestartTimer();
-  if (mlxAudioState.process) {
-    mlxAudioState.process.kill("SIGTERM");
-  }
-}
-
-function stopSayTtsServer() {
-  sayTtsState.shuttingDown = true;
-  clearSayTtsRestartTimer();
-  if (sayTtsState.process) {
-    sayTtsState.process.kill("SIGTERM");
-  }
-}
-
 function schedulePeerRestart(bridgeURL) {
   if (peerState.shuttingDown || !config.autoStartPionPeer) {
     return;
@@ -669,29 +276,21 @@ function startPionPeer(bridgeURL) {
     return;
   }
 
-  const args = [
-    "run",
-    "-tags",
-    "nolibopusfile",
-    "./cmd/pion_bridge_peer",
-    "-bridge-url",
-    bridgeURL
-  ];
-  const childEnv = { ...process.env };
-  const selectedPionTtsModel = (childEnv.PION_TTS_MODEL || childEnv.AGENT_TTS_MODEL || config.agentTtsModel || "").trim().toLowerCase();
-  const useSayTts = selectedPionTtsModel === "say-tts";
-  if (config.autoStartSayTTSServer && config.autoConfigurePionTtsBaseUrl && useSayTts) {
-    const ttsBaseURL = `http://${config.sayTtsHost}:${config.sayTtsPort}`;
-    if (!childEnv.PION_TTS_BASE_URL || !childEnv.PION_TTS_BASE_URL.trim()) {
-      childEnv.PION_TTS_BASE_URL = ttsBaseURL;
-    }
-    if (!childEnv.AGENT_TTS_BASE_URL || !childEnv.AGENT_TTS_BASE_URL.trim()) {
-      childEnv.AGENT_TTS_BASE_URL = ttsBaseURL;
-    }
-  }
-  const child = spawn("go", args, {
+  const hasPionBinary = config.pionPeerBinaryPath && fs.existsSync(config.pionPeerBinaryPath);
+  const command = hasPionBinary ? config.pionPeerBinaryPath : "go";
+  const args = hasPionBinary
+    ? ["-bridge-url", bridgeURL]
+    : [
+        "run",
+        "-tags",
+        "nolibopusfile",
+        "./cmd/pion_bridge_peer",
+        "-bridge-url",
+        bridgeURL
+      ];
+  const child = spawn(command, args, {
     cwd: repoRoot,
-    env: childEnv,
+    env: process.env,
     stdio: ["ignore", "pipe", "pipe"]
   });
 
@@ -727,19 +326,19 @@ function clearAgentRestartTimer() {
 }
 
 function ensureAgentRuntimeReady() {
-  const runnerCheck = spawnSync(config.agentRunnerCommand, ["--version"], {
+  const runnerCheck = spawnSync("uv", ["--version"], {
     cwd: repoRoot,
     env: process.env,
     encoding: "utf8"
   });
   if (runnerCheck.error) {
     throw new Error(
-      `Agent runner '${config.agentRunnerCommand}' is not available: ${runnerCheck.error.message}`
+      `Agent runner 'uv' is not available: ${runnerCheck.error.message}`
     );
   }
   if (runnerCheck.status !== 0) {
     throw new Error(
-      `Agent runner '${config.agentRunnerCommand}' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
+      `Agent runner 'uv' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
     );
   }
 
@@ -749,7 +348,7 @@ function ensureAgentRuntimeReady() {
   }
 
   const importScript = requiredImports.map((name) => `import ${name}`).join("; ");
-  const importCheck = spawnSync(config.agentRunnerCommand, ["run", "python", "-c", importScript], {
+  const importCheck = spawnSync("uv", ["run", "python", "-c", importScript], {
     cwd: repoRoot,
     env: process.env,
     encoding: "utf8"
@@ -990,20 +589,12 @@ function startAgentProcess() {
 
   ensureAgentRuntimeReady();
 
-  const agentApiBase = config.agentApiBase || mlxApiBase();
-  const agentModel = config.agentModel || config.mlxModel;
   const args = [
     "run",
     "agent.py",
-    "--stdio",
-    "--api-base",
-    agentApiBase,
-    "--api-key",
-    config.agentApiKey,
-    "--model",
-    agentModel
+    "--stdio"
   ];
-  const child = spawn(config.agentRunnerCommand, args, {
+  const child = spawn("uv", args, {
     cwd: repoRoot,
     env: process.env,
     stdio: ["pipe", "pipe", "pipe"]
@@ -1349,9 +940,6 @@ async function boot() {
   const credentials = await getBridgeCredentials();
   await initializeFirebaseRuntime(credentials);
   scheduleFirebaseRestart();
-  startMlxServer();
-  startMlxAudioServer();
-  startSayTtsServer();
   startAgentProcess();
   app.listen(config.port, () => {
     const bridgeURL = `http://127.0.0.1:${config.port}`;
@@ -1365,16 +953,6 @@ app.post("/turn-credentials", asyncHandler(async (req, res) => {
     const creds = await getTurnCredentials(req.app.locals.functions);
     return res.json(creds);
   } catch (err) {
-    const peerId = String(req.body?.peerId || "").trim() || "peer";
-    const ttlSeconds = Number.parseInt(String(req.body?.ttlSeconds || ""), 10);
-    if (config.turnAuthSecret) {
-      try {
-        const fallbackCreds = makeTurnCredentials({ peerId, ttlSeconds });
-        return res.json(fallbackCreds);
-      } catch (_) {
-        // Ignore and return the original Firebase error below.
-      }
-    }
     return res.status(500).json({ error: err.message || String(err) });
   }
 }));
@@ -1397,9 +975,6 @@ process.on("SIGINT", () => {
   clearFirebaseRestartTimer();
   stopTurnRefreshLoop();
   stopAgentProcess();
-  stopMlxServer();
-  stopMlxAudioServer();
-  stopSayTtsServer();
   shutdownPeer();
   process.exit(0);
 });
@@ -1408,9 +983,6 @@ process.on("SIGTERM", () => {
   clearFirebaseRestartTimer();
   stopTurnRefreshLoop();
   stopAgentProcess();
-  stopMlxServer();
-  stopMlxAudioServer();
-  stopSayTtsServer();
   shutdownPeer();
   process.exit(0);
 });

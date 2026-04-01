@@ -2,15 +2,19 @@
 
 import argparse
 import json
+import os
 import sys
 from typing import Any
 
 from openai import OpenAI
 
 
-DEFAULT_MODEL = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
-DEFAULT_API_BASE = "http://127.0.0.1:8000/v1"
-DEFAULT_API_KEY = "mlx-local"
+DEFAULT_MODEL = (os.getenv("AGENT_MODEL") or os.getenv("MLX_MODEL") or "mlx-community/Qwen3-4B-Instruct-2507-4bit").strip()
+DEFAULT_API_BASE = (
+    os.getenv("AGENT_API_BASE")
+    or f"http://{(os.getenv('MLX_HOST') or '127.0.0.1').strip()}:{(os.getenv('MLX_PORT') or '8000').strip()}/v1"
+).strip()
+DEFAULT_API_KEY = (os.getenv("AGENT_API_KEY") or "mlx-local").strip()
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful local coding assistant. "
     "Be concise, accurate, and practical."

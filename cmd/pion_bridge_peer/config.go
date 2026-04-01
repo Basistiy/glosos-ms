@@ -118,9 +118,6 @@ func loadCfg() cfg {
 	if ttsBaseURL == "" {
 		ttsBaseURL = strings.TrimSpace(os.Getenv("AGENT_TTS_BASE_URL"))
 	}
-	if ttsBaseURL == "" {
-		ttsBaseURL = sttBaseURL
-	}
 
 	ttsModel := strings.TrimSpace(os.Getenv("PION_TTS_MODEL"))
 	if ttsModel == "" {
@@ -128,6 +125,9 @@ func loadCfg() cfg {
 	}
 	if ttsModel == "" {
 		ttsModel = defaultTtsModel
+	}
+	if ttsBaseURL == "" {
+		ttsBaseURL = resolveTTSBaseURL(ttsModel, sttBaseURL)
 	}
 
 	ttsAPIKey := strings.TrimSpace(os.Getenv("PION_TTS_API_KEY"))
@@ -265,6 +265,21 @@ func defaultLanguageForTTSModel(model string) string {
 	default:
 		return defaultTtsLanguage
 	}
+}
+
+func resolveTTSBaseURL(ttsModel string, sttBaseURL string) string {
+	if strings.EqualFold(strings.TrimSpace(ttsModel), "say-tts") {
+		if override := strings.TrimSpace(os.Getenv("SAY_TTS_BASE_URL")); override != "" {
+			return override
+		}
+		host := strings.TrimSpace(os.Getenv("SAY_TTS_HOST"))
+		if host == "" {
+			host = "127.0.0.1"
+		}
+		port := parseEnvInt("SAY_TTS_PORT", 8112)
+		return fmt.Sprintf("http://%s:%d", host, port)
+	}
+	return sttBaseURL
 }
 
 func maxFloat64(a, b float64) float64 {
