@@ -226,6 +226,12 @@ func (p *speechPipeline) processSegment(samples []float32) {
 		go func() {
 			defer close(speechDone)
 			for {
+				// Give cancellation priority over draining any already-buffered chunks.
+				select {
+				case <-turnCtx.Done():
+					return
+				default:
+				}
 				select {
 				case <-turnCtx.Done():
 					return
@@ -233,10 +239,16 @@ func (p *speechPipeline) processSegment(samples []float32) {
 					if !ok {
 						return
 					}
+					if turnCtx.Err() != nil {
+						return
+					}
 					if strings.TrimSpace(chunk) == "" {
 						continue
 					}
 					if err := p.ttsStreamer.Speak(chunk); err != nil {
+						if turnCtx.Err() != nil || errors.Is(err, context.Canceled) {
+							return
+						}
 						log.Printf("tts speak error: %v", err)
 					}
 				}
