@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ -z "${ONNX_RUNTIME_LIB_PATH:-}" ]; then
-  ONNX_RUNTIME_LIB_PATH="$(python3 - <<'PY'
+  ONNX_RUNTIME_LIB_PATH="$(/opt/venv/bin/python3 - <<'PY'
 import pathlib
 import onnxruntime
 base = pathlib.Path(onnxruntime.__file__).resolve().parent / "capi"
@@ -17,20 +17,4 @@ PY
   export ONNX_RUNTIME_LIB_PATH
 fi
 
-RUNTIME_PID=""
-
-if [ "${AUTO_START_RUNTIME_SERVERS:-1}" != "0" ]; then
-  npm --prefix /app/bridge run start:runtime &
-  RUNTIME_PID="$!"
-fi
-
-cleanup() {
-  if [ -n "${RUNTIME_PID}" ]; then
-    kill "${RUNTIME_PID}" 2>/dev/null || true
-    wait "${RUNTIME_PID}" 2>/dev/null || true
-  fi
-}
-
-trap cleanup INT TERM EXIT
-
-npm --prefix /app/bridge start
+exec npm --prefix /app/bridge start

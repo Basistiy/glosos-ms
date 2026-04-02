@@ -326,19 +326,19 @@ function clearAgentRestartTimer() {
 }
 
 function ensureAgentRuntimeReady() {
-  const runnerCheck = spawnSync("uv", ["--version"], {
+  const runnerCheck = spawnSync("python3", ["--version"], {
     cwd: repoRoot,
     env: process.env,
     encoding: "utf8"
   });
   if (runnerCheck.error) {
     throw new Error(
-      `Agent runner 'uv' is not available: ${runnerCheck.error.message}`
+      `Agent runner 'python3' is not available: ${runnerCheck.error.message}`
     );
   }
   if (runnerCheck.status !== 0) {
     throw new Error(
-      `Agent runner 'uv' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
+      `Agent runner 'python3' failed its version check: ${runnerCheck.stderr || runnerCheck.stdout}`
     );
   }
 
@@ -348,7 +348,7 @@ function ensureAgentRuntimeReady() {
   }
 
   const importScript = requiredImports.map((name) => `import ${name}`).join("; ");
-  const importCheck = spawnSync("uv", ["run", "python", "-c", importScript], {
+  const importCheck = spawnSync("python3", ["-c", importScript], {
     cwd: repoRoot,
     env: process.env,
     encoding: "utf8"
@@ -589,12 +589,8 @@ function startAgentProcess() {
 
   ensureAgentRuntimeReady();
 
-  const args = [
-    "run",
-    "agent.py",
-    "--stdio"
-  ];
-  const child = spawn("uv", args, {
+  const args = ["agent.py", "--stdio"];
+  const child = spawn("python3", args, {
     cwd: repoRoot,
     env: process.env,
     stdio: ["pipe", "pipe", "pipe"]

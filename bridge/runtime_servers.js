@@ -38,6 +38,14 @@ export function createRuntimeServers({ config, repoRoot, prefixStream }) {
     }
   }
 
+  function pythonInvocation(runnerCommand, pythonArgs) {
+    const runner = (runnerCommand || "").trim();
+    if (runner === "uv") {
+      return { command: "uv", args: ["run", "python", ...pythonArgs] };
+    }
+    return { command: runner || "python3", args: pythonArgs };
+  }
+
   function ensureMlxRuntimeReady() {
     const runnerCheck = spawnSync(config.mlxRunnerCommand, ["--version"], {
       cwd: repoRoot,
@@ -55,7 +63,8 @@ export function createRuntimeServers({ config, repoRoot, prefixStream }) {
       );
     }
 
-    const importCheck = spawnSync(config.mlxRunnerCommand, ["run", "python", "-c", "import mlx_lm"], {
+    const mlxImport = pythonInvocation(config.mlxRunnerCommand, ["-c", "import mlx_lm"]);
+    const importCheck = spawnSync(mlxImport.command, mlxImport.args, {
       cwd: repoRoot,
       env: process.env,
       encoding: "utf8"
@@ -88,15 +97,15 @@ export function createRuntimeServers({ config, repoRoot, prefixStream }) {
       );
     }
 
-    const importCheck = spawnSync(
+    const mlxAudioImport = pythonInvocation(
       config.mlxAudioRunnerCommand,
-      ["run", "python", "-c", "import mlx_audio, uvicorn, fastapi, webrtcvad, multipart, phonemizer"],
-      {
-        cwd: repoRoot,
-        env: process.env,
-        encoding: "utf8"
-      }
+      ["-c", "import mlx_audio, uvicorn, fastapi, webrtcvad, multipart, phonemizer"],
     );
+    const importCheck = spawnSync(mlxAudioImport.command, mlxAudioImport.args, {
+      cwd: repoRoot,
+      env: process.env,
+      encoding: "utf8"
+    });
     if (importCheck.error) {
       throw new Error(`MLX audio dependency check failed: ${importCheck.error.message}`);
     }
@@ -125,15 +134,12 @@ export function createRuntimeServers({ config, repoRoot, prefixStream }) {
       );
     }
 
-    const importCheck = spawnSync(
-      config.sayTtsRunnerCommand,
-      ["run", "python", "-c", "import fastapi, uvicorn"],
-      {
-        cwd: repoRoot,
-        env: process.env,
-        encoding: "utf8"
-      }
-    );
+    const sayImport = pythonInvocation(config.sayTtsRunnerCommand, ["-c", "import fastapi, uvicorn"]);
+    const importCheck = spawnSync(sayImport.command, sayImport.args, {
+      cwd: repoRoot,
+      env: process.env,
+      encoding: "utf8"
+    });
     if (importCheck.error) {
       throw new Error(`say-tts dependency check failed: ${importCheck.error.message}`);
     }
@@ -182,9 +188,7 @@ export function createRuntimeServers({ config, repoRoot, prefixStream }) {
 
     ensureMlxRuntimeReady();
 
-    const args = [
-      "run",
-      "python",
+    const mlxServer = pythonInvocation(config.mlxRunnerCommand, [
       "-m",
       "mlx_lm.server",
       "--model",
@@ -193,8 +197,8 @@ export function createRuntimeServers({ config, repoRoot, prefixStream }) {
       config.mlxHost,
       "--port",
       String(config.mlxPort)
-    ];
-    const child = spawn(config.mlxRunnerCommand, args, {
+    ]);
+    const child = spawn(mlxServer.command, mlxServer.args, {
       cwd: repoRoot,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"]
@@ -223,17 +227,15 @@ export function createRuntimeServers({ config, repoRoot, prefixStream }) {
 
     ensureMlxAudioRuntimeReady();
 
-    const args = [
-      "run",
-      "python",
+    const mlxAudioServer = pythonInvocation(config.mlxAudioRunnerCommand, [
       "-m",
       "mlx_audio.server",
       "--host",
       config.mlxAudioHost,
       "--port",
       String(config.mlxAudioPort)
-    ];
-    const child = spawn(config.mlxAudioRunnerCommand, args, {
+    ]);
+    const child = spawn(mlxAudioServer.command, mlxAudioServer.args, {
       cwd: repoRoot,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"]
@@ -262,16 +264,14 @@ export function createRuntimeServers({ config, repoRoot, prefixStream }) {
 
     ensureSayTtsRuntimeReady();
 
-    const args = [
-      "run",
-      "python",
+    const sayServer = pythonInvocation(config.sayTtsRunnerCommand, [
       config.sayTtsScriptPath,
       "--host",
       config.sayTtsHost,
       "--port",
       String(config.sayTtsPort)
-    ];
-    const child = spawn(config.sayTtsRunnerCommand, args, {
+    ]);
+    const child = spawn(sayServer.command, sayServer.args, {
       cwd: repoRoot,
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"]

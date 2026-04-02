@@ -10,3 +10,10 @@ node_modules
 logs
 assets
 .DS_Store
+**/.DS_Store
+functions
+firebase.json
+FIREBASE_SIGNALING.md
+install_components.sh
+services/say_tts_server.README.md
+docker/README.md
