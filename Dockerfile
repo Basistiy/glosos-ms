@@ -25,13 +25,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-venv \
+    python3-dev \
+    build-essential \
     ca-certificates \
     curl \
     libopus0 \
   && rm -rf /var/lib/apt/lists/*
 
-RUN python3 -m pip install --no-cache-dir --upgrade pip && \
-    python3 -m pip install --no-cache-dir uv openai onnxruntime
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
+RUN python -m pip install --no-cache-dir --upgrade pip && \
+    python -m pip install --no-cache-dir uv openai onnxruntime
 
 COPY bridge/package*.json ./bridge/
 RUN npm install --prefix ./bridge --omit=dev
